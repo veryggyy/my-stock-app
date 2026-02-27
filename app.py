@@ -17,7 +17,6 @@ def get_stock_list():
     if not os.path.exists(cache_file): return fallback
     
     try:
-        # 編碼容錯處理
         for enc in ['utf-8-sig', 'big5', 'gbk']:
             try:
                 df = pd.read_csv(cache_file, dtype=str, encoding=enc)
@@ -25,12 +24,9 @@ def get_stock_list():
             except: continue
         
         df.columns = [c.strip() for c in df.columns]
-        
-        # 智慧搜尋代號與名稱欄位，若找不到就抓前兩欄
         code_col = next((c for c in df.columns if any(k in c for k in ['代號', 'code', 'Code'])), df.columns[0])
         name_col = next((c for c in df.columns if any(k in c for k in ['名稱', 'label', 'Name'])), df.columns[min(1, len(df.columns)-1)])
         
-        # 提取 4 位數數字代號
         df['clean_code'] = df[code_col].str.extract(r'(\d{4})')
         df = df.dropna(subset=['clean_code'])
         
@@ -40,34 +36,33 @@ def get_stock_list():
         st.error(f"CSV 讀取錯誤: {e}")
         return fallback
 
-# --- 2. 核心分析功能 (修正 Scipy 取值錯誤) ---
+# --- 2. 核心分析功能 ---
 def fast_analyze(data, order):
     try:
         if data is None or len(data) < 40: return None
         
-        # 處理 yfinance 多層 Index
         df = data.copy()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
         prices = df['Close'].values.flatten().astype(float)
-        # 檢查是否有足夠的價格資料
         if len(prices[~np.isnan(prices)]) < 40: return None
         
         ma20 = df['Close'].rolling(20).mean().iloc[-1]
         curr_price = prices[-1]
 
-        # 重要：argrelextrema 回傳的是 tuple，要抓 [0] 才是索引陣列
         low_idx = argrelextrema(prices, np.less, order=order)[0]
         if len(low_idx) < 2: return None
         
-        last_low, prev_low = prices[low_idx[-1]], prices[low_idx[-2]]
+        last_low = prices[low_idx[-1]]
+        prev_low = prices[low_idx[-2]]
 
         # 核心條件：底底高 + 現價不低於月線 4%
         if last_low > prev_low and curr_price > (ma20 * 0.96):
             return {
                 "現價": round(curr_price, 2),
-                "支撐價": round(last_low, 2),
+                "建議買進價格": round(last_low, 2),  # 以支撐價作為建議買點
+                "賣出價格": round(last_low * 1.15, 2), # 範例：支撐價 + 15% 作為目標
                 "風險距離%": round((curr_price/last_low-1)*100, 1),
                 "成交量": "🔥 爆量" if df['Volume'].iloc[-1] > df['Volume'].rolling(20).mean().iloc[-1]*1.5 else "正常"
             }
@@ -94,19 +89,22 @@ if start_btn:
         
         with st.spinner(f"正在極速下載並分析 {len(symbols)} 檔台股..."):
             try:
-                # 使用 threads=True 加速
                 raw_data = yf.download(symbols, period="6mo", group_by='ticker', threads=True, progress=False)
                 
                 for idx, (sym, name) in enumerate(stock_dict.items()):
                     try:
-                        # 提取個別股票資料
                         stock_df = raw_data[sym] if len(symbols) > 1 else raw_data
                         if stock_df.empty: continue
                         
                         res = fast_analyze(stock_df, sens)
                         if res:
-                            res.update({"股票名稱": name, "代號": sym.split('.')[0]})
-                            all_results.append(res)
+                            # 重新排列字典順序：名稱與代號置前
+                            final_res = {
+                                "代號": sym.split('.')[0],
+                                "股票名稱": name
+                            }
+                            final_res.update(res)
+                            all_results.append(final_res)
                     except: continue
                     
                     if idx % 100 == 0: 
@@ -118,9 +116,11 @@ if start_btn:
 
         if all_results:
             st.success(f"發現 {len(all_results)} 檔符合型態標的")
-            st.dataframe(pd.DataFrame(all_results).sort_values(by="風險距離%"), use_container_width=True)
+            # 轉換為 DataFrame 並依「現價」低至高排序
+            result_df = pd.DataFrame(all_results).sort_values(by="現價", ascending=True)
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
         else:
             st.warning("查無符合標的。建議將「靈敏度」調低。")
 
 st.markdown("---")
-st.caption("修正：修復 argrelextrema 索引讀取與 CSV 欄位偏移錯誤。")
+st.caption("調整：已將代號名稱移至左側，並依現價由低至高排序。")
