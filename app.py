@@ -15,11 +15,8 @@ def get_full_taiwan_stock_list():
     cache_file = "taiwan_stock_list.csv"
     if os.path.exists(cache_file):
         try:
-            # 讀取 CSV
             df = pd.read_csv(cache_file, dtype=str)
             df.columns = [c.strip() for c in df.columns]
-            
-            # 尋找關鍵欄位
             code_col = next((c for c in df.columns if 'code' in c.lower() or '代號' in c), df.columns[0])
             label_col = next((c for c in df.columns if 'label' in c.lower() or '名稱' in c or '股票' in c), df.columns[0])
             market_col = next((c for c in df.columns if '市場' in c or '類別' in c), None)
@@ -28,30 +25,18 @@ def get_full_taiwan_stock_list():
             for _, row in df.iterrows():
                 code = str(row[code_col]).strip()
                 name = str(row[label_col]).strip()
-                
-                # 自動後綴判斷：若代號本身已有後綴則不處理，否則根據市場判斷
                 if "." in code:
                     symbol = code.upper()
                 elif market_col and ('櫃' in str(row[market_col]) or 'OTC' in str(row[market_col]).upper()):
                     symbol = f"{code}.TWO"
                 else:
                     symbol = f"{code}.TW"
-                
                 stocks.append({"label": name, "code": code, "symbol": symbol})
             return stocks
-        except Exception as e:
-            st.error(f"解析 CSV 失敗: {e}")
-            
-    # 預設回退方案
+        except: pass
     return [{"label": "台積電", "code": "2330", "symbol": "2330.TW"}]
 
-def format_num(val):
-    try:
-        f_val = float(val)
-        return int(f_val) if f_val % 1 == 0 else round(f_val, 2)
-    except: return val
-
-# --- 2. 核心分析邏輯 ---
+# --- 2. 核心分析邏輯 (增加欄位強健性) ---
 def analyze_with_backtest(df_batch, selected_stocks_chunk, order):
     results = []
     backtest_days = 30 
@@ -59,45 +44,44 @@ def analyze_with_backtest(df_batch, selected_stocks_chunk, order):
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            # 兼容 yfinance 多檔與單檔下載的資料結構
+            # 強制提取該股票的資料，處理 MultiIndex 或單一 Index
             if isinstance(df_batch.columns, pd.MultiIndex):
-                if symbol not in df_batch.columns.levels[0]: continue
-                data = df_batch[symbol].dropna()
+                if symbol not in df_batch.columns.get_level_values(0): continue
+                data = df_batch[symbol].copy()
             else:
-                data = df_batch.dropna()
-                
+                data = df_batch.copy()
+            
+            data = data.dropna(subset=['Close'])
             if len(data) < 60: continue
             
-            prices = data['Close'].values
+            prices = data['Close'].values.astype(float)
             curr_price = float(prices[-1])
-            ma20 = float(data['Close'].rolling(20).mean().iloc[-1])
+            ma20 = data['Close'].rolling(20).mean().iloc[-1]
             
-            # 尋找局部低點
+            # 尋找低點
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             if len(low_idx) < 2: continue
             
-            last_low, prev_low = float(prices[low_idx[-1]]), float(prices[low_idx[-2]])
+            last_low, prev_low = prices[low_idx[-1]], prices[low_idx[-2]]
             
-            # --- 回測邏輯 ---
-            sim_return = "N/A"
-            hist_data = data.iloc[:-backtest_days]
-            if len(hist_data) > 40:
-                h_prices = hist_data['Close'].values
-                h_low_idx = argrelextrema(h_prices, np.less, order=order)[0]
-                if len(h_low_idx) >= 2:
-                    # 歷史回測：當時滿足 底底高 且 站上均線
-                    if h_prices[h_low_idx[-1]] > h_prices[h_low_idx[-2]] and h_prices[-1] > hist_data['Close'].rolling(20).mean().iloc[-1]:
-                        ret = (curr_price / h_prices[-1] - 1) * 100
-                        sim_return = f"{round(ret, 1)}%"
-
-            # --- 當前篩選條件 (稍微放寬現價限制) ---
-            # 條件：1.底底高 2.現價不低於月線 3% (避免錯過剛站回的標的)
+            # 判斷條件：底底高 + 現價在月線附近或上方
             if last_low > prev_low and curr_price > (ma20 * 0.97):
+                # 簡單模擬回測
+                sim_return = "N/A"
+                hist_data = data.iloc[:-backtest_days]
+                if len(hist_data) > 40:
+                    h_prices = hist_data['Close'].values
+                    h_low_idx = argrelextrema(h_prices, np.less, order=order)[0]
+                    if len(h_low_idx) >= 2:
+                        if h_prices[h_low_idx[-1]] > h_prices[h_low_idx[-2]] and h_prices[-1] > (hist_data['Close'].rolling(20).mean().iloc[-1] * 0.97):
+                            ret = (curr_price / h_prices[-1] - 1) * 100
+                            sim_return = f"{round(ret, 1)}%"
+
                 results.append({
                     "股票名稱": s['label'],
                     "代號": s['code'],
-                    "現價": format_num(curr_price),
-                    "支撐價": format_num(last_low),
+                    "現價": round(curr_price, 2),
+                    "支撐價": round(last_low, 2),
                     "風險距離%": round((curr_price/last_low-1)*100, 1),
                     "30日模擬報酬": sim_return,
                     "成交量狀態": "🔥 爆量" if data['Volume'].iloc[-1] > data['Volume'].rolling(20).mean().iloc[-1]*2 else "正常"
@@ -111,59 +95,44 @@ all_stocks = get_full_taiwan_stock_list()
 
 with st.sidebar:
     st.header("⚙️ 參數設定")
-    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 10, help="數值越小，篩選出的短線轉折越多")
+    sens = st.slider("趨勢靈敏度 (Order)", 3, 20, 5) # 最小值降到 3
     st.info(f"📊 當前清單共: {len(all_stocks)} 檔")
-    debug_mode = st.checkbox("開啟除錯模式 (顯示抓取狀態)")
+    debug_mode = st.checkbox("開啟詳細除錯日誌")
     start_btn = st.button("🚀 啟動掃描與歷史回測")
 
 if start_btn:
     total_count = len(all_stocks)
-    chunk_size = 15  # 縮小批次以防被 Yahoo 封鎖
+    chunk_size = 10 
     all_results = []
     progress_bar = st.progress(0)
     status_msg = st.empty()
     
-    with st.spinner("正在下載並分析數據，請稍候..."):
+    with st.spinner("正在執行掃描中..."):
         for i in range(0, total_count, chunk_size):
             chunk = all_stocks[i : i + chunk_size]
             symbols = [s['symbol'] for s in chunk]
             
-            if debug_mode:
-                status_msg.text(f"掃描中: {symbols[0]} 等 {len(symbols)} 檔...")
-                
             try:
-                # 下載數據，設定 auto_adjust 為 True 確保價格連續
-                df_batch = yf.download(symbols, period="1y", progress=False, group_by='ticker', auto_adjust=True, threads=True)
+                # auto_adjust=True 讓價格標準化，免去 Open/Close 欄位混淆
+                df_batch = yf.download(symbols, period="1y", progress=False, group_by='ticker', auto_adjust=True)
                 
                 if not df_batch.empty:
                     batch_res = analyze_with_backtest(df_batch, chunk, sens)
                     all_results.extend(batch_res)
+                    if debug_mode and batch_res:
+                        st.write(f"✅ 批次 {i} 發現: {[r['股票名稱'] for r in batch_res]}")
             except Exception as e:
-                if debug_mode: st.warning(f"批次錯誤: {e}")
+                if debug_mode: st.error(f"❌ 批次 {i} 下載錯誤: {e}")
             
             progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
-            time.sleep(0.8) # 適度延遲
+            time.sleep(0.5)
 
-    status_msg.empty()
-    
     if all_results:
         df = pd.DataFrame(all_results)
-        # 計算勝率
-        valid_rets = [float(x.replace('%','')) for x in df["30日模擬報酬"] if x != "N/A"]
-        
-        if valid_rets:
-            st.subheader("📈 策略績效驗證 (近 30 日)")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("模擬標的數", f"{len(valid_rets)} 檔")
-            win_rate = len([x for x in valid_rets if x > 0])/len(valid_rets)*100
-            c2.metric("平均勝率", f"{round(win_rate, 1)}%")
-            avg_ret = sum(valid_rets)/len(valid_rets)
-            c3.metric("平均報酬", f"{round(avg_ret, 2)}%")
-        
         st.success(f"發現 {len(df)} 檔符合型態標的")
         st.dataframe(df.sort_values(by="風險距離%"), use_container_width=True)
     else:
-        st.warning("查無符合標的。建議嘗試將「趨勢靈敏度」調低至 5 或 7。")
+        st.warning("查無符合標的。可能是網路受阻，請稍後再試或檢查代號。")
 
 st.markdown("---")
-st.caption("註：本系統僅供型態教學參考，不構成任何投資建議。資料來源：Yahoo Finance")
+st.caption("資料來源：Yahoo Finance。僅供參考。")
