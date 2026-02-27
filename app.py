@@ -16,7 +16,7 @@ try:
 except AttributeError:
     pass
 else:
-    ssl._create_default_https_context = _create_unverified_context
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 st.set_page_config(page_title="2026 全台股掃描器", layout="wide")
 
