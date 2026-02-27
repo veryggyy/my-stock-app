@@ -9,70 +9,85 @@ import os
 # --- 1. 頁面基礎設定 ---
 st.set_page_config(page_title="2026 台股趨勢回測掃描系統", layout="wide")
 
-@st.cache_data(ttl=3600) # 縮短快取時間，確保更新 CSV 後能生效
+@st.cache_data(ttl=3600)
 def get_full_taiwan_stock_list():
-    """終極容錯版：自動辨識並清洗 CSV 欄位"""
+    """自動辨識上市(.TW)與上櫃(.TWO)並清洗資料"""
     cache_file = "taiwan_stock_list.csv"
     if os.path.exists(cache_file):
         try:
-            # 讀取 CSV 並清除所有欄位名與內容的空白/逗號
-            df = pd.read_csv(cache_file, dtype=str).apply(lambda x: x.str.strip().str.replace(',', ''))
-            df.columns = [c.strip().replace(',', '') for c in df.columns]
+            # 讀取並清洗空白
+            df = pd.read_csv(cache_file, dtype=str)
+            df.columns = [c.strip() for c in df.columns]
             
-            # 智慧欄位對應：尋找包含 'code' 或 '代號' 的欄位作為基準
             code_col = next((c for c in df.columns if 'code' in c.lower() or '代號' in c), df.columns[0])
             label_col = next((c for c in df.columns if 'label' in c.lower() or '名稱' in c or '股票' in c), df.columns[0])
-            
-            # 建立標準格式
-            new_df = pd.DataFrame()
-            new_df['label'] = df[label_col]
-            new_df['code'] = df[code_col]
-            # 強制生成標準 symbol (例如 2330.TW)
-            new_df['symbol'] = df[code_col].apply(lambda x: x if '.TW' in x or '.TWO' in x else f"{x}.TW")
-            
-            return new_df.to_dict('records')
+            market_col = next((c for c in df.columns if '市場' in c or '類別' in c), None)
+
+            stocks = []
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip()
+                name = str(row[label_col]).strip()
+                
+                # 自動判斷後綴 (若 CSV 有市場欄位則精確判斷，否則預設 .TW)
+                if market_col and '櫃' in str(row[market_col]):
+                    symbol = f"{code}.TWO"
+                else:
+                    symbol = f"{code}.TW" if ".TW" not in code.upper() else code
+                
+                stocks.append({"label": name, "code": code, "symbol": symbol})
+            return stocks
         except Exception as e:
-            st.error(f"解析 CSV 失敗，請檢查檔案格式: {e}")
+            st.error(f"解析 CSV 失敗: {e}")
             
     return [{"label": "台積電", "code": "2330", "symbol": "2330.TW"}]
 
 def format_num(val):
-    """去掉數值尾數的 .0"""
+    """美化數值顯示"""
     try:
         f_val = float(val)
         return int(f_val) if f_val % 1 == 0 else round(f_val, 2)
     except: return val
 
-# --- 2. 核心分析與 30 日回測邏輯 ---
+# --- 2. 核心分析與回測邏輯 ---
 def analyze_with_backtest(df_batch, selected_stocks_chunk, order):
     results = []
     backtest_days = 30 
+    
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            if symbol not in df_batch: continue
-            data = df_batch[symbol].dropna()
+            # 處理 yfinance 多檔下載後的資料結構
+            if isinstance(df_batch.columns, pd.MultiIndex):
+                if symbol not in df_batch.columns.levels[0]: continue
+                data = df_batch[symbol].dropna()
+            else:
+                data = df_batch.dropna() # 只有單檔時
+                
             if len(data) < 60: continue
             
             prices = data['Close'].values
             curr_price = float(prices[-1])
             ma20 = float(data['Close'].rolling(20).mean().iloc[-1])
             
-            low_idx = argrelextrema(prices, np.less, order=order)
+            # 尋找局部低點 (W底初步型態)
+            low_idx = argrelextrema(prices, np.less, order=order)[0]
             if len(low_idx) < 2: continue
+            
             last_low, prev_low = float(prices[low_idx[-1]]), float(prices[low_idx[-2]])
             
-            # 30天前回測邏輯
+            # --- 30 日前回測邏輯 ---
             sim_return = "N/A"
             hist_data = data.iloc[:-backtest_days]
             if len(hist_data) > 40:
                 h_prices = hist_data['Close'].values
-                h_low_idx = argrelextrema(h_prices, np.less, order=order)
+                h_low_idx = argrelextrema(h_prices, np.less, order=order)[0]
                 if len(h_low_idx) >= 2:
+                    # 判斷當時是否符合：底底高 + 站上均線
                     if h_prices[h_low_idx[-1]] > h_prices[h_low_idx[-2]] and h_prices[-1] > hist_data['Close'].rolling(20).mean().iloc[-1]:
                         ret = (curr_price / h_prices[-1] - 1) * 100
                         sim_return = f"{round(ret, 1)}%"
 
+            # --- 當前掃描判斷 ---
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'],
@@ -92,38 +107,54 @@ all_stocks = get_full_taiwan_stock_list()
 
 with st.sidebar:
     st.header("⚙️ 參數設定")
-    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 8)
+    sens = st.slider("趨勢靈敏度 (Order)", 5, 30, 10, help="數值愈大，找出的轉折點愈大級別")
     st.info(f"📊 當前清單共: {len(all_stocks)} 檔")
     start_btn = st.button("🚀 啟動掃描與歷史回測")
 
 if start_btn:
     total_count = len(all_stocks)
-    chunk_size = 30
+    chunk_size = 20 # 縮小批次以提高穩定性
     all_results = []
     progress_bar = st.progress(0)
+    status_text = st.empty()
     
     with st.spinner("正在下載並分析大數據..."):
         for i in range(0, total_count, chunk_size):
             chunk = all_stocks[i : i + chunk_size]
             symbols = [s['symbol'] for s in chunk]
+            status_text.text(f"正在掃描: {i}/{total_count}")
             try:
-                df_batch = yf.download(symbols, period="1y", progress=False, group_by='ticker')
+                # 使用 threads=True 加速下載
+                df_batch = yf.download(symbols, period="1y", progress=False, group_by='ticker', threads=True)
                 if not df_batch.empty:
                     all_results.extend(analyze_with_backtest(df_batch, chunk, sens))
-            except: pass
+            except Exception as e:
+                pass
+            
             progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
-            time.sleep(0.5)
+            time.sleep(0.2) # 避免 API 頻繁請求被鎖
 
+    status_text.empty()
+    
     if all_results:
         df = pd.DataFrame(all_results)
+        # 計算勝率
         valid_rets = [float(x.replace('%','')) for x in df["30日模擬報酬"] if x != "N/A"]
+        
         if valid_rets:
             st.subheader("📈 策略績效驗證 (近 30 日)")
             c1, c2, c3 = st.columns(3)
             c1.metric("模擬標的數", f"{len(valid_rets)} 檔")
-            c2.metric("平均勝率", f"{round(len([x for x in valid_rets if x > 0])/len(valid_rets)*100, 1)}%")
-            c3.metric("平均報酬", f"{round(sum(valid_rets)/len(valid_rets), 2)}%")
-        st.success(f"發現 {len(df)} 檔符合型態標的")
+            win_rate = len([x for x in valid_rets if x > 0])/len(valid_rets)*100
+            c2.metric("平均勝率", f"{round(win_rate, 1)}%")
+            avg_ret = sum(valid_rets)/len(valid_rets)
+            c3.metric("平均報酬", f"{round(avg_ret, 2)}%")
+        
+        st.success(f"發現 {len(df)} 檔符合「底底高」型態標的")
         st.dataframe(df.sort_values(by="風險距離%"), use_container_width=True)
     else:
-        st.warning("查無符合標的。")
+        st.warning("查無符合標的。請嘗試調低「趨勢靈敏度」或檢查網路連線。")
+
+# --- 頁尾說明 ---
+st.markdown("---")
+st.caption("註：本系統僅供型態教學參考，不構成任何投資建議。")
