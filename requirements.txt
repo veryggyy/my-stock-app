@@ -1,0 +1,7 @@
+text
+streamlit
+yfinance
+pandas
+requests
+scipy
+lxml
