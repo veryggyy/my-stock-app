@@ -16,7 +16,7 @@ def get_all_stocks():
             "https://isin.twse.com.tw"]
     stocks = []
     for url in urls:
-        res = requests.get(url)
+        res = requests.get(url, verify=False)
         df = pd.read_html(res.text)[0]
         df.columns = df.iloc[0]
         for item in df['有價證券代號及名稱'].iloc[1:]:
