@@ -1,126 +1,115 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from scipy.signal import argrelextrema
 import numpy as np
 import os
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="2026 台股極速掃描系統", layout="wide")
+st.set_page_config(page_title="2026 趨勢波段掃描系統", layout="wide")
 
 @st.cache_data(ttl=3600)
 def get_stock_list():
-    """超強健 CSV 讀取：自動校正欄位與編碼"""
+    """CSV 讀取與自動校正"""
     cache_file = "taiwan_stock_list.csv"
     fallback = {"2330.TW": "台積電"}
-    
     if not os.path.exists(cache_file): return fallback
-    
     try:
         for enc in ['utf-8-sig', 'big5', 'gbk']:
             try:
                 df = pd.read_csv(cache_file, dtype=str, encoding=enc)
                 break
             except: continue
-        
         df.columns = [c.strip() for c in df.columns]
-        code_col = next((c for c in df.columns if any(k in c for k in ['代號', 'code', 'Code'])), df.columns[0])
-        name_col = next((c for c in df.columns if any(k in c for k in ['名稱', 'label', 'Name'])), df.columns[min(1, len(df.columns)-1)])
-        
+        code_col = next((c for c in df.columns if any(k in c for k in ['代號', 'code'])), df.columns[0])
+        name_col = next((c for c in df.columns if any(k in c for k in ['名稱', 'label'])), df.columns[min(1, len(df.columns)-1)])
         df['clean_code'] = df[code_col].str.extract(r'(\d{4})')
         df = df.dropna(subset=['clean_code'])
-        
-        if df.empty: return fallback
         return {f"{row['clean_code']}.TW": str(row[name_col]).strip() for _, row in df.iterrows()}
-    except Exception as e:
-        st.error(f"CSV 讀取錯誤: {e}")
-        return fallback
+    except: return fallback
 
-# --- 2. 核心分析功能 ---
-def fast_analyze(data, order):
+# --- 2. 核心技術分析 (多頭排列 + 進場過濾) ---
+def advanced_analyze(data, symbol, name):
     try:
-        if data is None or len(data) < 40: return None
-        
+        if data is None or len(data) < 70: return None # 需足夠 K 線計算 60MA
         df = data.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        prices = df['Close'].values.flatten().astype(float)
-        if len(prices[~np.isnan(prices)]) < 40: return None
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         
-        ma20 = df['Close'].rolling(20).mean().iloc[-1]
-        curr_price = prices[-1]
-
-        low_idx = argrelextrema(prices, np.less, order=order)[0]
-        if len(low_idx) < 2: return None
+        # 指標計算
+        df['MA20'] = df['Close'].rolling(20).mean()
+        df['MA60'] = df['Close'].rolling(60).mean()
+        df['VMA20'] = df['Volume'].rolling(20).mean()
         
-        last_low = prices[low_idx[-1]]
-        prev_low = prices[low_idx[-2]]
+        # MACD 計算
+        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        hist = macd - signal
 
-        # 核心條件：底底高 + 現價不低於月線 4%
-        if last_low > prev_low and curr_price > (ma20 * 0.96):
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # --- 策略篩選 ---
+        # 1. 選股：20MA > 60MA (多頭排列)
+        is_bull = curr['MA20'] > curr['MA60']
+        if not is_bull: return None
+
+        # 2. 進場判斷：
+        # A. 帶量突破 (今日收盤 > 昨日高點 且 量 > 20日均量1.5倍)
+        is_breakout = (curr['Close'] > prev['High']) and (curr['Volume'] > curr['VMA20'] * 1.5)
+        # B. 回測月線不破 且 MACD 紅柱
+        is_support = (curr['Low'] <= curr['MA20'] * 1.02) and (curr['Close'] >= curr['MA20']) and (hist.iloc[-1] > 0)
+
+        if is_breakout or is_support:
             return {
-                "現價": round(curr_price, 2),
-                "建議買進價格": round(last_low, 2),  # 以支撐價作為建議買點
-                "賣出價格": round(last_low * 1.15, 2), # 範例：支撐價 + 15% 作為目標
-                "風險距離%": round((curr_price/last_low-1)*100, 1),
-                "成交量": "🔥 爆量" if df['Volume'].iloc[-1] > df['Volume'].rolling(20).mean().iloc[-1]*1.5 else "正常"
+                "代號": symbol.split('.')[0],
+                "股票名稱": name,
+                "現價": round(curr['Close'], 2),
+                "短中期買進價位": round(curr['MA20'], 2), # 建議於月線附近佈局
+                "波段目標/賣出價": round(curr['Close'] * 1.15, 2), # 設定 15% 為初步目標
+                "出場防守位": round(curr['MA20'] * 0.97, 2), # 跌破月線 3% 視為轉弱
+                "型態": "🚀 帶量突破" if is_breakout else "📉 回測支撐",
+                "MACD": "🔴 紅柱" if hist.iloc[-1] > 0 else "🟢 綠柱",
+                "成交量": "🔥 爆量" if curr['Volume'] > curr['VMA20'] * 1.5 else "正常"
             }
     except: return None
     return None
 
 # --- 3. UI 介面 ---
-st.title("⚡ TW 2026 極速趨勢掃描器")
+st.title("⚡ TW 2026 極速趨勢波段掃描器")
 stock_dict = get_stock_list()
 symbols = list(stock_dict.keys())
 
 with st.sidebar:
-    st.header("⚙️ 參數設定")
-    sens = st.slider("趨勢靈敏度 (Order)", 2, 12, 4)
-    st.info(f"📊 待掃描清單: {len(symbols)} 檔")
-    start_btn = st.button("🚀 啟動極速掃描")
+    st.header("⚙️ 策略參數")
+    st.info("策略規則：\n1. 20MA > 60MA\n2. 帶量突破 或 回測月線\n3. 跌破 20MA 則波段結束")
+    st.write(f"📊 待掃描清單: {len(symbols)} 檔")
+    start_btn = st.button("🚀 執行策略掃描")
 
 if start_btn:
-    if not symbols:
-        st.error("❌ 掃描清單為空！請檢查 CSV 資料。")
-    else:
-        all_results = []
-        progress_bar = st.progress(0)
+    all_results = []
+    progress_bar = st.progress(0)
+    
+    with st.spinner(f"正在分析波段標的..."):
+        # 下載半年資料以計算 60MA
+        raw_data = yf.download(symbols, period="8mo", group_by='ticker', threads=True, progress=False)
         
-        with st.spinner(f"正在極速下載並分析 {len(symbols)} 檔台股..."):
-            try:
-                raw_data = yf.download(symbols, period="6mo", group_by='ticker', threads=True, progress=False)
-                
-                for idx, (sym, name) in enumerate(stock_dict.items()):
-                    try:
-                        stock_df = raw_data[sym] if len(symbols) > 1 else raw_data
-                        if stock_df.empty: continue
-                        
-                        res = fast_analyze(stock_df, sens)
-                        if res:
-                            # 重新排列字典順序：名稱與代號置前
-                            final_res = {
-                                "代號": sym.split('.')[0],
-                                "股票名稱": name
-                            }
-                            final_res.update(res)
-                            all_results.append(final_res)
-                    except: continue
-                    
-                    if idx % 100 == 0: 
-                        progress_bar.progress(min((idx + 1) / len(symbols), 1.0))
-                
-                progress_bar.progress(1.0)
-            except Exception as e:
-                st.error(f"下載過程發生錯誤: {e}")
+        for idx, (sym, name) in enumerate(stock_dict.items()):
+            stock_df = raw_data[sym] if len(symbols) > 1 else raw_data
+            if stock_df.empty: continue
+            
+            res = advanced_analyze(stock_df, sym, name)
+            if res: all_results.append(res)
+            
+            if idx % 50 == 0: progress_bar.progress(min((idx + 1) / len(symbols), 1.0))
+        progress_bar.progress(1.0)
 
-        if all_results:
-            st.success(f"發現 {len(all_results)} 檔符合型態標的")
-            # 轉換為 DataFrame 並依「現價」低至高排序
-            result_df = pd.DataFrame(all_results).sort_values(by="現價", ascending=True)
-            st.dataframe(result_df, use_container_width=True, hide_index=True)
-        else:
-            st.warning("查無符合標的。建議將「靈敏度」調低。")
+    if all_results:
+        st.success(f"發現 {len(all_results)} 檔符合「多頭排列 + 進場訊號」標的")
+        df_res = pd.DataFrame(all_results).sort_values(by="現價")
+        st.dataframe(df_res, use_container_width=True, hide_index=True)
+    else:
+        st.warning("目前市場無符合多頭回測條件之標的。")
 
 st.markdown("---")
-st.caption("調整：已將代號名稱移至左側，並依現價由低至高排序。")
+st.caption("策略備註：出場建議參考 MACD 高檔死叉或收盤價跌破月線（20MA）。")
