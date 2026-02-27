@@ -3,63 +3,57 @@ import yfinance as yf
 import pandas as pd
 from scipy.signal import argrelextrema
 import numpy as np
+import time
 
 # 頁面基礎設定
-st.set_page_config(page_title="2026 台股趨勢專業掃描器", layout="wide")
+st.set_page_config(page_title="2026 全台股趨勢終極掃描器", layout="wide")
 
 @st.cache_data(ttl=86400)
-def get_all_stocks():
-    """取得股票清單：優先從穩定來源讀取"""
+def get_full_taiwan_stock_list():
+    """取得完整的全台股清單 (上市+上櫃)"""
     try:
+        # 使用 GitHub 穩定來源，抓取所有台股編號
         url = "https://raw.githubusercontent.com"
         df = pd.read_csv(url)
         stocks = []
         for _, row in df.iterrows():
             code = str(row['code'])
             name = str(row['name'])
+            # 篩選 4 碼普通股
             if len(code) == 4:
                 suffix = ".TW" if row['market'] == 'sii' else ".TWO"
                 stocks.append({"label": name, "code": code, "symbol": f"{code}{suffix}"})
         return stocks
-    except:
-        # 權值股備援清單
-        data = {"2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2308":"台達電", "2382":"廣達", "2881":"富邦金", "2882":"國泰金", "2891":"中信金"}
-        return [{"label": name, "code": code, "symbol": f"{code}.TW"} for code, name in data.items()]
+    except Exception as e:
+        st.error(f"清單獲取失敗: {e}")
+        return []
 
-def analyze_batch(df_all, selected_stocks, order):
-    """批次分析邏輯：精準處理 MultiIndex 並計算建議價位"""
+def analyze_chunk(df_chunk, selected_stocks_chunk, order):
+    """分析一組批次資料"""
     results = []
-    
-    # 檢查下載的資料結構
-    if df_all.empty or 'Close' not in df_all:
+    if df_chunk.empty or 'Close' not in df_chunk:
         return results
 
-    for s in selected_stocks:
+    for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            # 確保從 MultiIndex 中正確提取該股的收盤價
-            if symbol not in df_all['Close'].columns:
+            if symbol not in df_chunk['Close'].columns:
                 continue
                 
-            series = df_all['Close'][symbol].dropna()
-            if len(series) < 40:
-                continue
+            series = df_chunk['Close'][symbol].dropna()
+            if len(series) < 40: continue
             
             prices = series.values
-            # 尋找局部低點
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             
-            if len(low_idx) < 2:
-                continue
+            if len(low_idx) < 2: continue
             
             last_low = float(prices[low_idx[-1]])
             prev_low = float(prices[low_idx[-2]])
             curr_price = float(prices[-1])
-            
-            # 計算 20MA
             ma20 = float(series.rolling(20).mean().iloc[-1])
             
-            # 核心邏輯：底底高 + 股價站上 20MA
+            # 趨勢邏輯：底底高 + 站上 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'],
@@ -70,55 +64,76 @@ def analyze_batch(df_all, selected_stocks, order):
                     "支撐價位": round(last_low, 2),
                     "幅度": f"{round((curr_price/last_low-1)*100, 1)}%"
                 })
-        except Exception:
+        except:
             continue
-            
     return results
 
 # --- UI 介面 ---
-st.title("⚡ TW 2026 台股趨勢自動掃描系統 (專業版)")
-st.markdown("採用 **yfinance 批次模式**，自動計算買進/賣出建議價位。")
+st.title("🛡️ TW 2026 全台股趨勢終極掃描系統")
+st.markdown("本模式將遍歷**全台上市櫃約 1,800+ 檔個股**，自動篩選底底高且站上 20MA 的標的。")
 
 with st.sidebar:
-    st.header("設定參數")
-    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 10, help="Order 越大，篩選出的轉折點越顯著。若找不到標的，請調低此數值。")
-    limit = st.number_input("掃描數量 (建議 50-200)", 10, 1000, 50)
-    start_btn = st.button("🚀 開始高速掃描")
+    st.header("掃描設定")
+    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 8, help="建議設為 5-10 以獲得較多標的")
+    st.info("💡 全台股掃描約需 2-5 分鐘，請保持網頁開啟。")
+    start_btn = st.button("🔥 啟動全台股深度掃描")
 
 if start_btn:
-    with st.status("🚀 執行高速掃描中...", expanded=True) as status:
-        st.write("📋 正在初始化股票清單...")
-        all_stocks = get_all_stocks()
-        selected_stocks = all_stocks[:int(limit)]
-        symbols = [s['symbol'] for s in selected_stocks]
-        
-        st.write(f"📥 正在下載 {len(symbols)} 檔資料並分析趨勢...")
-        # 下載資料
-        df_all = yf.download(symbols, period="6mo", progress=False, group_by='column')
-        
-        # 執行批次分析
-        final_results = analyze_batch(df_all, selected_stocks, sens)
-        
-        status.update(label="✅ 掃描任務完成！", state="complete", expanded=False)
-
-    if final_results:
-        final_df = pd.DataFrame(final_results)
-        # 依價位由高到低排序
-        final_df = final_df.sort_values(by="現價", ascending=False)
-        
-        st.success(f"🎉 在 {len(selected_stocks)} 檔中找到 {len(final_df)} 檔符合條件標的！")
-        
-        # 欄位重新排序與抬頭顯示
-        display_cols = ['股票名稱', '代號', '現價', '建議買進', '建議賣出', '支撐價位', '幅度']
-        st.dataframe(
-            final_df[display_cols], 
-            use_container_width=True,
-            column_config={
-                "現價": st.column_config.NumberColumn(format="%.2f"),
-                "建議買進": st.column_config.NumberColumn(format="%.2f", help="參考支撐價位上浮 1%"),
-                "建議賣出": st.column_config.NumberColumn(format="%.2f", help="預估短線獲利 10%"),
-                "支撐價位": st.column_config.NumberColumn(format="%.2f")
-            }
-        )
+    all_stocks = get_full_taiwan_stock_list()
+    
+    if not all_stocks:
+        st.error("無法載入股票清單。")
     else:
-        st.warning("☹️ 未找到符合條件標的，建議**增加掃描數量**或將**靈敏度 (Order) 調低**（例如 5-8）。")
+        total_count = len(all_stocks)
+        chunk_size = 100 # 每組下載 100 檔，避免被 Yahoo 封鎖
+        all_results = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # 開始分批掃描
+        with st.spinner("深度掃描進行中..."):
+            for i in range(0, total_count, chunk_size):
+                chunk = all_stocks[i : i + chunk_size]
+                symbols = [s['symbol'] for s in chunk]
+                
+                status_text.text(f"正在掃描區段: {i} ~ {min(i+chunk_size, total_count)} (總計 {total_count} 檔)")
+                
+                # 批次下載
+                try:
+                    df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column')
+                    # 執行分析
+                    chunk_results = analyze_chunk(df_batch, chunk, sens)
+                    all_results.extend(chunk_results)
+                except Exception as e:
+                    st.warning(f"區段 {i} 抓取異常，已跳過。")
+                
+                # 更新進度條
+                progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
+                # 稍微延遲避免請求過快
+                time.sleep(0.5)
+
+        status_text.text("✅ 全台股深度掃描完成！")
+
+        if all_results:
+            final_df = pd.DataFrame(all_results)
+            # 依價位排序
+            final_df = final_df.sort_values(by="現價", ascending=False)
+            
+            st.success(f"🎉 掃描完畢！在全台股中找到 {len(final_df)} 檔符合條件標的。")
+            
+            # 顯示表格
+            display_cols = ['股票名稱', '代號', '現價', '建議買進', '建議賣出', '支撐價位', '幅度']
+            st.dataframe(
+                final_df[display_cols], 
+                use_container_width=True,
+                column_config={
+                    "現價": st.column_config.NumberColumn(format="%.2f"),
+                    "建議買進": st.column_config.NumberColumn(format="%.2f"),
+                    "建議賣出": st.column_config.NumberColumn(format="%.2f"),
+                    "支撐價位": st.column_config.NumberColumn(format="%.2f")
+                }
+            )
+        else:
+            st.warning("☹️ 掃描全台股後未發現符合條件標的，請嘗試調低「靈敏度 (Order)」。")
+
