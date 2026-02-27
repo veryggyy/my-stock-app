@@ -6,17 +6,13 @@ import numpy as np
 import time
 import os
 
-# 頁面基礎設定
-st.set_page_config(page_title="2026 全台股趨勢終極掃描系統", layout="wide")
+# --- 1. 頁面基礎設定 ---
+st.set_page_config(page_title="2026 台股趨勢終極掃描系統", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_full_taiwan_stock_list():
-    """
-    最高穩定度獲取邏輯：優先讀取 GitHub 上的 CSV 檔案。
-    """
+    """優先讀取 GitHub/本地 CSV 檔案，失敗則提供核心權值股"""
     cache_file = "taiwan_stock_list.csv"
-    
-    # 1. 優先從同目錄下的 CSV 檔案讀取 (解決所有 SSL/連線報錯)
     if os.path.exists(cache_file):
         try:
             df = pd.read_csv(cache_file, dtype={'code': str})
@@ -24,7 +20,6 @@ def get_full_taiwan_stock_list():
         except Exception as e:
             st.error(f"讀取 CSV 失敗: {e}")
 
-    # 2. 如果沒檔案（例如第一次建立），提供核心權值股保底
     return [
         {"label": "台積電", "code": "2330", "symbol": "2330.TW"},
         {"label": "鴻海", "code": "2317", "symbol": "2317.TW"},
@@ -34,8 +29,8 @@ def get_full_taiwan_stock_list():
         {"label": "緯創", "code": "3231", "symbol": "3231.TW"}
     ]
 
+# --- 2. 核心分析邏輯 ---
 def analyze_chunk(df_batch, selected_stocks_chunk, order):
-    """分析核心邏輯：篩選底底高且站上 20MA 的標的"""
     results = []
     if df_batch is None or df_batch.empty:
         return results
@@ -43,54 +38,80 @@ def analyze_chunk(df_batch, selected_stocks_chunk, order):
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            # 處理 yfinance 多重索引資料結構
-            if symbol not in df_batch:
-                continue
+            if symbol not in df_batch: continue
             
-            # 取得收盤價序列
-            series = df_batch[symbol]['Close'].dropna()
-            if len(series) < 40: continue
+            # 取得數據 (Close & Volume)
+            data = df_batch[symbol].dropna()
+            if len(data) < 40: continue
             
-            prices = series.values
-            # 尋找波段低點 (局部極小值)
+            close_series = data['Close']
+            vol_series = data['Volume']
+            prices = close_series.values
+            
+            # A. RSI 計算 (14日)
+            delta = close_series.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            curr_rsi = rsi.iloc[-1]
+            
+            # B. 成交量暴增判斷 (今日成交量 > 20日均量 2 倍)
+            avg_vol = vol_series.rolling(20).mean().iloc[-1]
+            curr_vol = vol_series.iloc[-1]
+            vol_spike = curr_vol > (avg_vol * 2)
+            
+            # C. 趨勢與波段低點 (底底高)
             low_idx = argrelextrema(prices, np.less, order=order)[0]
-            
             if len(low_idx) < 2: continue
             
+            curr_price = float(prices[-1])
+            ma20 = float(close_series.rolling(20).mean().iloc[-1])
             last_low = float(prices[low_idx[-1]])
             prev_low = float(prices[low_idx[-2]])
-            curr_price = float(prices[-1])
-            ma20 = float(series.rolling(20).mean().iloc[-1])
             
-            # 策略：最新低點 > 前一低點 (底底高) 且 現價高於 20MA
-            if last_low > prev_low and curr_price > ma20:
+            # D. 策略篩選：底底高 + 站上 20MA + RSI 不過熱 (<70)
+            if last_low > prev_low and curr_price > ma20 and curr_rsi < 70:
+                # 買賣建議價位
+                support_price = round(last_low, 2)
+                buy_min = round(support_price * 1.01, 2)
+                buy_max = round(support_price * 1.05, 2)
+                take_profit = round(curr_price * 1.15, 2)  # 預設 15% 停利
+                stop_loss = round(support_price * 0.97, 2) # 支撐下方 3%
+                
                 results.append({
                     "股票名稱": s['label'],
                     "代號": s['code'],
                     "現價": round(curr_price, 2),
-                    "支撐價位": round(last_low, 2),
-                    "趨勢偏離": f"{round((curr_price/last_low-1)*100, 1)}%"
+                    "RSI(14)": round(curr_rsi, 1),
+                    "成交量狀態": "🔥 爆量" if vol_spike else "正常",
+                    "建議買進區間": f"{buy_min} - {buy_max}",
+                    "支撐價位": support_price,
+                    "停利目標": take_profit,
+                    "停損價位": stop_loss,
+                    "風險距離(%)": round((curr_price/support_price-1)*100, 1)
                 })
         except:
             continue
     return results
 
-# --- UI 介面 ---
+# --- 3. UI 介面 ---
 st.title("🛡️ TW 2026 全台股趨勢終極掃描系統")
-st.markdown("系統目前使用 **CSV 靜態清單** 模式，確保連線 100% 穩定。")
-
-# 預先載入股票清單
 all_stocks = get_full_taiwan_stock_list()
 
 with st.sidebar:
-    st.header("掃描設定")
-    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 8, help="建議設為 8-10")
-    st.info(f"📊 目前清單內含 {len(all_stocks)} 檔標的。")
+    st.header("📊 掃描與排序設定")
+    # 排序功能
+    sort_option = st.selectbox(
+        "結果排序方式", 
+        ["風險距離(%) 由小到大", "價位由高到低", "價位由低到高", "RSI 強弱"]
+    )
+    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 8, help="較小的值會抓到更細微的轉折")
     start_btn = st.button("🔥 啟動全台股深度掃描")
 
 if start_btn:
     total_count = len(all_stocks)
-    chunk_size = 40 # 分組下載，避免 API 頻繁連線被鎖
+    chunk_size = 40 
     all_results = []
     
     progress_bar = st.progress(0)
@@ -100,28 +121,46 @@ if start_btn:
         for i in range(0, total_count, chunk_size):
             chunk = all_stocks[i : i + chunk_size]
             symbols = [s['symbol'] for s in chunk]
-            
             status_text.text(f"掃描進度: {i} / {total_count}")
             
             try:
-                # 下載近 6 個月數據，使用 group_by='ticker' 提高穩定度
                 df_batch = yf.download(symbols, period="6mo", progress=False, group_by='ticker', threads=True)
                 if not df_batch.empty:
                     chunk_results = analyze_chunk(df_batch, chunk, sens)
                     all_results.extend(chunk_results)
-            except Exception as e:
+            except:
                 pass 
             
-            # 更新進度條
             progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
-            time.sleep(0.5) # 降低對 Yahoo API 的請求頻率
+            time.sleep(0.5)
 
-    status_text.text("✅ 全台股深度掃描完成！")
+    status_text.text("✅ 掃描完成！")
 
     if all_results:
         final_df = pd.DataFrame(all_results)
-        final_df = final_df.sort_values(by="趨勢偏離")
-        st.success(f"🎉 在清單中找到 {len(final_df)} 檔符合條件標的。")
-        st.dataframe(final_df, use_container_width=True)
+        
+        # --- 排序邏輯 ---
+        if sort_option == "風險距離(%) 由小到大":
+            final_df = final_df.sort_values(by="風險距離(%)")
+        elif sort_option == "價位由高到低":
+            final_df = final_df.sort_values(by="現價", ascending=False)
+        elif sort_option == "價位由低到高":
+            final_df = final_df.sort_values(by="現價", ascending=True)
+        else:
+            final_df = final_df.sort_values(by="RSI(14)", ascending=False)
+
+        st.success(f"🎉 找到 {len(final_df)} 檔符合條件標的。")
+
+        # 視覺化：爆量顯示紅色背景
+        def highlight_vol(val):
+            color = '#3d1c1c' if val == "🔥 爆量" else ''
+            return f'background-color: {color}'
+
+        st.dataframe(
+            final_df.style.applymap(highlight_vol, subset=['成交量狀態']), 
+            use_container_width=True
+        )
     else:
-        st.warning("☹️ 目前靈敏度下未發現符合標的，請嘗試調低靈敏度。")
+        st.warning("☹️ 目前條件下未發現符合標的。")
+
+st.info("💡 提示：'風險距離' 越小代表現價越靠近支撐點，進場風險相對較低。")
