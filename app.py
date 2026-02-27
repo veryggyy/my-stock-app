@@ -3,13 +3,14 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
+import re
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="2026 台股趨勢波段掃描器", layout="wide")
 
 @st.cache_data(ttl=3600)
 def get_stock_list():
-    """超強健 CSV 讀取與自動校正"""
+    """讀取 CSV 並校正格式"""
     cache_file = "taiwan_stock_list.csv"
     fallback = {"2330.TW": "台積電"}
     
@@ -31,10 +32,11 @@ def get_stock_list():
         df = df.dropna(subset=['clean_code'])
         
         if df.empty: return fallback
+        # 這裡保留原始名稱，後續在分析函數中再進行清洗
         return {f"{row['clean_code']}.TW": str(row[name_col]).strip() for _, row in df.iterrows()}
     except: return fallback
 
-# --- 2. 核心技術分析 (20MA/60MA 多頭 + MACD 邏輯) ---
+# --- 2. 核心技術分析 ---
 def analyze_trend_strategy(data, symbol, name):
     try:
         if data is None or len(data) < 70: return None
@@ -70,9 +72,13 @@ def analyze_trend_strategy(data, symbol, name):
         is_support = (curr['Low'] <= curr['MA20'] * 1.02) and (curr['Close'] >= curr['MA20'] * 0.99) and (hist.iloc[-1] > 0)
 
         if is_breakout or is_support:
+            # 💡 關鍵修正：只保留中文名稱，剔除後面的數字與代碼
+            # 使用 split 分割空格取第一個，或用 regex 過濾掉數字部分
+            clean_name = re.split(r'[\s0-9]', name)[0]
+            
             return {
                 "代號": symbol.split('.')[0],
-                "股票名稱": name,
+                "股票名稱": clean_name,
                 "現價": round(curr['Close'], 2),
                 "短中期買進價位": round(curr['MA20'], 2),
                 "波段目標/賣出價": round(curr['Close'] * 1.15, 2),
@@ -107,12 +113,11 @@ if start_btn:
     
     with st.spinner(f"正在安全下載並分析 {len(symbols)} 檔台股..."):
         try:
-            # 關鍵修正：threads=False 解決 Python 3.13 的 RuntimeError
+            # 修正 Python 3.13 相容性問題
             raw_data = yf.download(symbols, period="8mo", group_by='ticker', threads=False, progress=False)
             
             for idx, (sym, name) in enumerate(stock_dict.items()):
                 try:
-                    # 抓取單一股票資料 (修正多股下載後的索引提取)
                     if len(symbols) > 1:
                         stock_df = raw_data[sym]
                     else:
@@ -134,7 +139,7 @@ if start_btn:
     if all_results:
         st.success(f"發現 {len(all_results)} 檔符合策略標的")
         
-        # 技術解釋抬頭
+        # 頂部解釋區塊
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("#### 🟢 型態解釋")
@@ -153,9 +158,18 @@ if start_btn:
         
         # 顯示結果表格
         df_res = pd.DataFrame(all_results).sort_values(by="現價", ascending=True)
-        st.dataframe(df_res, use_container_width=True, hide_index=True)
+        st.dataframe(
+            df_res, 
+            use_container_width=True, 
+            hide_index=True,
+            column_config={
+                "代號": st.column_config.TextColumn("代號"),
+                "股票名稱": st.column_config.TextColumn("股票名稱"),
+                "現價": st.column_config.NumberColumn("現價", format="%.2f")
+            }
+        )
     else:
         st.warning("查無符合多頭排列與進場條件的股票。")
 
 st.markdown("---")
-st.caption("修復記錄：已關閉多執行緒下載以相容 Python 3.13 環境，並增加欄位正確性校驗。")
+st.caption("註：股票名稱已優化為僅顯示中文。若 CSV 格式特殊，請檢查欄位內容。")
