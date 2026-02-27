@@ -17,43 +17,42 @@ st.set_page_config(page_title="2026 全台股趨勢終極掃描器", layout="wid
 
 @st.cache_data(ttl=86400)
 def get_full_taiwan_stock_list():
-    """模擬瀏覽器行為，從證交所獲取清單並修正 No tables found 錯誤"""
+    """模擬真人造訪證交所，解決 No tables found 錯誤"""
     stocks = []
     urls = [
         ("https://isin.twse.com.tw", ".TW"),  # 上市
         ("https://isin.twse.com.tw", ".TWO") # 上櫃
     ]
     
-    # 模擬 Chrome 瀏覽器 Header，避免被伺服器阻擋
+    # 模擬 Chrome 瀏覽器，避免被伺服器阻擋
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
     try:
         for url, suffix in urls:
-            # 關鍵修正：先用 requests 抓取網頁內容
+            # 關鍵修正：先用 requests 抓取 HTML 內容
             response = requests.get(url, headers=headers, verify=False, timeout=15)
             response.encoding = 'big5' # 證交所使用 big5 編碼
             
-            # 使用 StringIO 封裝，避免 pandas 直接讀取 URL 失敗
+            # 將抓到的文字內容交給 pandas 解析
             html_data = StringIO(response.text)
             df_list = pd.read_html(html_data)
             
             if not df_list: continue
-            df = df_list[0] # 取得主表格
+            df = df_list[0] 
             
-            # 整理資料：設定欄位名
+            # 整理資料欄位
             df.columns = df.iloc[0]
             df = df.iloc[1:]
             
             for item in df['有價證券代號及名稱']:
                 if pd.isna(item): continue
-                # 處理「代號 名称」格式: "2330　台積電"
                 parts = item.replace('　', ' ').split(' ')
                 if len(parts) >= 2:
                     code = parts[0]
                     name = parts[1]
-                    # 篩選 4 碼純數字普通股 (排除權證、ETF)
+                    # 篩選 4 碼純數字普通股 (排除權證、ETF、特別股)
                     if len(code) == 4 and code.isdigit():
                         stocks.append({"label": name, "code": code, "symbol": f"{code}{suffix}"})
         return stocks
@@ -62,7 +61,7 @@ def get_full_taiwan_stock_list():
         return []
 
 def analyze_chunk(df_batch, selected_stocks_chunk, order):
-    """分析邏輯：篩選底底高且站上 20MA 的標的"""
+    """底底高 + 20MA 趨勢核心邏輯"""
     results = []
     if df_batch is None or df_batch.empty:
         return results
@@ -70,26 +69,25 @@ def analyze_chunk(df_batch, selected_stocks_chunk, order):
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            # 檢查 yfinance 抓回的資料中是否有該股 Close 欄位
-            if symbol not in df_batch['Close'].columns:
-                continue
+            # 判斷 yfinance 回傳的多重索引資料
+            if symbol not in df_batch['Close'].columns: continue
             series = df_batch['Close'][symbol].dropna()
             if len(series) < 40: continue
             
             prices = series.values
-            # 尋找波段低點
+            # 抓取局部低點
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             if len(low_idx) < 2: continue
             
             last_low, prev_low, curr_price = float(prices[low_idx[-1]]), float(prices[low_idx[-2]]), float(prices[-1])
             ma20 = float(series.rolling(20).mean().iloc[-1])
             
-            # 條件：底底高 (Higher Low) 且 現價 > 20MA
+            # 邏輯條件：最新低點 > 前一低點 且 現價 > 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'], "代號": s['code'], "現價": round(curr_price, 2),
                     "支撐價": round(last_low, 2), "建議買點": round(last_low * 1.01, 2),
-                    "幅度": f"{round((curr_price/last_low-1)*100, 1)}%"
+                    "偏離度": f"{round((curr_price/last_low-1)*100, 1)}%"
                 })
         except: continue
     return results
@@ -107,7 +105,7 @@ with st.sidebar:
 if start_btn:
     all_stocks = get_full_taiwan_stock_list()
     if not all_stocks:
-        st.error("無法載入股票清單，可能被伺服器阻擋，請稍後再試。")
+        st.error("無法載入股票清單，可能被伺服器暫時封鎖 IP，請稍後再試。")
     else:
         total_count = len(all_stocks)
         chunk_size = 50 
@@ -119,9 +117,9 @@ if start_btn:
             for i in range(0, total_count, chunk_size):
                 chunk = all_stocks[i : i + chunk_size]
                 symbols = [s['symbol'] for s in chunk]
-                status_text.text(f"掃描進度: {i} / {total_count}")
+                status_text.text(f"掃描進度: {i} / {total_count} 檔")
                 try:
-                    # 使用多執行緒加速
+                    # 使用 threads=True 加速下載
                     df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column', threads=True)
                     all_results.extend(analyze_chunk(df_batch, chunk, sens))
                 except: pass
