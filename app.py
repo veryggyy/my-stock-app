@@ -7,60 +7,72 @@ import re
 import time
 
 # --- 1. 頁面與樣式設定 ---
-st.set_page_config(page_title="2026 台股趨勢波段掃描器", layout="wide")
+st.set_page_config(page_title="2026 台股趨勢掃描器 (精簡穩定版)", layout="wide")
 
-# 加大表格字體與優化空間的 CSS
+# CSS 優化：加大字體、縮小邊距
 st.markdown("""
     <style>
     [data-testid="stTable"] { font-size: 18px !important; }
     .stDataFrame td { font-size: 16px !important; }
-    .stMetric { background-color: #1e2129; padding: 10px; border-radius: 10px; }
+    .stProgress > div > div > div > div { background-color: #00c853; }
     </style>
     """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=3600)
-def get_stock_list():
+def get_stock_list(limit=200):
+    """讀取清單並限制數量為 200 檔以確保速度"""
     cache_file = "taiwan_stock_list.csv"
-    fallback = {"2330.TW": "台積電"}
-    if not os.path.exists(cache_file): return fallback
-    try:
-        for enc in ['utf-8-sig', 'big5', 'gbk']:
-            try:
-                df = pd.read_csv(cache_file, dtype=str, encoding=enc)
-                break
-            except: continue
-        df.columns = [c.strip() for c in df.columns]
-        code_col = next((c for c in df.columns if any(k in c for k in ['代號', 'code'])), df.columns[0])
-        name_col = next((c for c in df.columns if any(k in c for k in ['名稱', 'label'])), df.columns[min(1, len(df.columns)-1)])
-        df['clean_code'] = df[code_col].str.extract(r'(\d{4})')
-        df = df.dropna(subset=['clean_code'])
-        return {f"{row['clean_code']}.TW": str(row[name_col]).strip() for _, row in df.iterrows()}
-    except: return fallback
+    stocks = {}
+    if os.path.exists(cache_file):
+        try:
+            for enc in ['utf-8-sig', 'big5', 'gbk']:
+                try:
+                    df = pd.read_csv(cache_file, dtype=str, encoding=enc)
+                    break
+                except: continue
+            
+            df.columns = [c.strip() for c in df.columns]
+            code_col = next((c for c in df.columns if any(k in c for k in ['代號', 'code'])), df.columns[0])
+            name_col = next((c for c in df.columns if any(k in c for k in ['名稱', 'label'])), df.columns[1])
+            
+            # 限制前 200 檔
+            df = df.head(limit)
+            stocks = {f"{str(row[code_col]).strip()}.TW": str(row[name_col]).strip() for _, row in df.iterrows()}
+        except: pass
+    
+    if not stocks: # 備援方案
+        stocks = {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科"}
+    return stocks
 
-# --- 2. 核心技術分析 (含排序權重) ---
 def analyze_trend_strategy(data, symbol, name):
+    """技術分析邏輯"""
     try:
-        if data is None or len(data) < 70: return None
+        if data is None or len(data) < 60: return None
         df = data.copy()
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA60'] = df['Close'].rolling(window=60).mean()
-        df['VMA20'] = df['Volume'].rolling(window=20).mean()
+        # 計算指標
+        df['MA20'] = df['Close'].rolling(20).mean()
+        df['MA60'] = df['Close'].rolling(60).mean()
+        df['VMA20'] = df['Volume'].rolling(20).mean()
         
         ema12 = df['Close'].ewm(span=12, adjust=False).mean()
         ema26 = df['Close'].ewm(span=26, adjust=False).mean()
         macd_hist = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
 
         curr, prev = df.iloc[-1], df.iloc[-2]
+        
+        # 1. 趨勢門檻：20MA > 60MA
         if not (curr['MA20'] > curr['MA60']): return None
 
+        # 2. 進場判定
         is_breakout = (curr['Close'] > prev['High']) and (curr['Volume'] > curr['VMA20'] * 1.5)
         is_support = (curr['Low'] <= curr['MA20'] * 1.02) and (curr['Close'] >= curr['MA20'] * 0.99) and (macd_hist.iloc[-1] > 0)
 
         if is_breakout or is_support:
-            # 優先級計算：帶量突破(2分) + 紅柱(1分)
+            # 優先級：帶量突破(2分) > 回測支撐(1分)；MACD紅柱(+1分)
             priority = (2 if is_breakout else 1) + (1 if macd_hist.iloc[-1] > 0 else 0)
+            # 名稱清洗：僅保留中文
             clean_name = re.split(r'[\s0-9]', name)[0]
             
             return {
@@ -78,59 +90,61 @@ def analyze_trend_strategy(data, symbol, name):
     except: return None
 
 # --- 3. UI 介面 ---
-st.title("⚡ TW 2026 極速波段掃描器")
+st.title("⚡ TW 2026 極速趨勢掃描器")
+st.subheader("🔍 精簡穩定版 (限定掃描前 200 檔)")
 
-stock_dict = get_stock_list()
+stock_dict = get_stock_list(limit=200)
 symbols = list(stock_dict.keys())
 
 with st.sidebar:
     st.header("⚙️ 策略參數")
-    st.info(f"📊 待掃描: {len(symbols)} 檔")
-    start_btn = st.button("🚀 啟動完整掃描")
+    st.markdown("**🎯 規則：20MA > 60MA + 型態觸發**")
+    st.info(f"📊 待掃描清單: {len(symbols)} 檔")
+    start_btn = st.button("🚀 啟動掃描")
 
 if start_btn:
     all_results = []
-    # 建立進場資訊區
-    progress_info = st.empty()
-    progress_bar = st.progress(0)
-    
+    prog_info = st.empty()
+    prog_bar = st.progress(0)
     start_time = time.time()
     
-    try:
-        # 下載數據
-        raw_data = yf.download(symbols, period="8mo", group_by='ticker', threads=False, progress=False)
+    # 分批下載以防轉圈圈 (每 50 檔一批)
+    batch_size = 50
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i : i + batch_size]
         
-        for idx, (sym, name) in enumerate(stock_dict.items()):
-            # 計算進度與預估時間
-            elapsed_time = time.time() - start_time
-            processed_count = idx + 1
-            avg_time_per_stock = elapsed_time / processed_count
-            remaining_stocks = len(symbols) - processed_count
-            est_remaining_time = int(avg_time_per_stock * remaining_stocks)
+        # 更新預估時間
+        elapsed = time.time() - start_time
+        processed = i
+        if processed > 0:
+            remaining = int((elapsed / processed) * (len(symbols) - processed))
+        else:
+            remaining = "計算中..."
             
-            percent = int((processed_count / len(symbols)) * 100)
-            progress_info.markdown(f"**🔍 掃描中:** `{percent}%` | **預估剩餘時間:** `{est_remaining_time} 秒` | **正在處理:** `{sym}`")
-            progress_bar.progress(processed_count / len(symbols))
+        prog_info.markdown(f"**⏳ 掃描進度:** `{int(i/len(symbols)*100)}%` | **預估剩餘:** `{remaining} 秒`")
+        prog_bar.progress(i / len(symbols))
+
+        try:
+            # threads=False 解決 Python 3.13 轉圈問題
+            raw_data = yf.download(batch, period="8mo", group_by='ticker', threads=False, progress=False)
             
-            try:
-                stock_df = raw_data[sym] if len(symbols) > 1 else raw_data
-                if stock_df.empty or len(stock_df) < 60: continue
-                res = analyze_trend_strategy(stock_df, sym, name)
-                if res: all_results.append(res)
-            except: continue
+            for sym in batch:
+                try:
+                    df = raw_data[sym] if len(batch) > 1 else raw_data
+                    if df.empty: continue
+                    res = analyze_trend_strategy(df, sym, stock_dict[sym])
+                    if res: all_results.append(res)
+                except: continue
+        except: continue
 
-        progress_info.success(f"✅ 掃描完成！耗時: {int(time.time() - start_time)} 秒")
-
-    except Exception as e:
-        st.error(f"掃描中斷: {e}")
+    prog_bar.progress(1.0)
+    prog_info.success(f"✅ 掃描完成！耗時: {int(time.time() - start_time)} 秒")
 
     if all_results:
         # 排序：優先級由高到低，現價由低到高
         df_res = pd.DataFrame(all_results).sort_values(by=["優先級", "現價"], ascending=[False, True])
         
         st.subheader(f"💡 發現 {len(all_results)} 檔優選標的 (由強至弱排序)")
-        
-        # 使用 column_config 縮小右側欄位面積，增加可視字體
         st.dataframe(
             df_res.drop(columns=['優先級']), 
             use_container_width=True, 
@@ -138,13 +152,13 @@ if start_btn:
             column_config={
                 "代號": st.column_config.TextColumn("代號", width="small"),
                 "股票名稱": st.column_config.TextColumn("股票名稱", width="medium"),
+                "現價": st.column_config.NumberColumn("現價", format="%.2f"),
                 "型態": st.column_config.TextColumn("型態", width="small"),
                 "MACD": st.column_config.TextColumn("MACD", width="small"),
-                "成交量": st.column_config.TextColumn("成交量", width="small"),
             }
         )
     else:
-        st.warning("目前市況查無符合條件標的。")
+        st.warning("查無符合多頭排列與進場條件的股票。")
 
 st.markdown("---")
-st.caption("2026 穩定版 | 優先級邏輯：帶量突破 > 回測支撐 | 字體已優化")
+st.caption("2026 穩定版 | 已優化字體與右側空間 | 限定掃描前 200 檔")
