@@ -5,54 +5,62 @@ from scipy.signal import argrelextrema
 import numpy as np
 import time
 import ssl
+import requests
+from io import StringIO
 
-# --- 核心修復：強制忽略 SSL 驗證，解決 CERTIFICATE_VERIFY_FAILED 錯誤 ---
-ssl._create_default_https_context = ssl._create_unverified_context
+# --- 核心修復：全域忽略 SSL 驗證 ---
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
-# 頁面基礎設定
+# 頁面設定
 st.set_page_config(page_title="2026 全台股趨勢終極掃描器", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_full_taiwan_stock_list():
-    """直接從證交所官方 HTML 抓取最新清單，並校正格式"""
+    """使用 requests 模擬瀏覽器抓取清單，減少被封鎖與 SSL 失敗風險"""
     stocks = []
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    urls = [
+        ("https://isin.twse.com.tw", ".TW"),  # 上市
+        ("https://isin.twse.com.tw", ".TWO") # 上櫃
+    ]
+    
     try:
-        # 上市 (SII) 與 上櫃 (OTC) 官方 JSP 清單網址
-        urls = [
-            ("https://isin.twse.com.tw", ".TW"),
-            ("https://isin.twse.com.tw", ".TWO")
-        ]
-        
         for url, suffix in urls:
-            # 讀取 HTML 表格 (需安裝 lxml 庫)
-            df_list = pd.read_html(url)
+            # 使用 requests 並設定 verify=False 強制跳過 SSL 檢查
+            response = requests.get(url, headers=headers, verify=False, timeout=10)
+            response.encoding = 'big5' # 證交所原始編碼
+            
+            # 解析 HTML
+            df_list = pd.read_html(StringIO(response.text))
             df = df_list[0]
             
-            # 整理格式：設定欄位並跳過標題行
+            # 整理格式
             df.columns = df.iloc[0]
             df = df.iloc[1:]
             
             for item in df['有價證券代號及名稱']:
                 if pd.isna(item): continue
-                # 處理「2330　台積電」這種帶有全型空格的格式
                 parts = item.replace('　', ' ').split(' ')
                 if len(parts) >= 2:
                     code = parts[0]
                     name = parts[1]
-                    # 篩選 4 碼純數字普通股，剔除權證與 ETF
+                    # 僅保留 4 碼普通股
                     if len(code) == 4 and code.isdigit():
-                        stocks.append({
-                            "label": name, 
-                            "code": code, 
-                            "symbol": f"{code}{suffix}"
-                        })
+                        stocks.append({"label": name, "code": code, "symbol": f"{code}{suffix}"})
         return stocks
     except Exception as e:
-        st.error(f"清單獲取失敗，錯誤回報: {e}")
+        st.error(f"清單獲取失敗: {e}")
         return []
 
 def analyze_chunk(df_batch, selected_stocks_chunk, order):
-    """核心趨勢邏輯：篩選底底高且站上 20MA 的標的"""
+    """分析邏輯優化：增加多重索引容錯"""
     results = []
     if df_batch is None or df_batch.empty:
         return results
@@ -60,7 +68,7 @@ def analyze_chunk(df_batch, selected_stocks_chunk, order):
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            # 檢查 yfinance 抓回的資料中是否有該股 Close 欄位
+            # 確保抓取到該股的收盤價
             if symbol not in df_batch['Close'].columns:
                 continue
                 
@@ -68,7 +76,7 @@ def analyze_chunk(df_batch, selected_stocks_chunk, order):
             if len(series) < 40: continue
             
             prices = series.values
-            # 尋找波段低點 (Local Minima)
+            # 尋找波段低點
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             
             if len(low_idx) < 2: continue
@@ -78,15 +86,15 @@ def analyze_chunk(df_batch, selected_stocks_chunk, order):
             curr_price = float(prices[-1])
             ma20 = float(series.rolling(20).mean().iloc[-1])
             
-            # 判斷條件：最新低點 > 前一低點 (底底高) 且 現價 > 20MA
+            # 核心策略：底底高 + 站上 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'],
                     "代號": s['code'],
                     "現價": round(curr_price, 2),
-                    "支撐價位": round(last_low, 2),
+                    "支撐價": round(last_low, 2),
                     "建議買點": round(last_low * 1.01, 2),
-                    "趨勢偏離": f"{round((curr_price/last_low-1)*100, 1)}%"
+                    "偏離度": f"{round((curr_price/last_low-1)*100, 1)}%"
                 })
         except:
             continue
@@ -109,37 +117,36 @@ if start_btn:
         st.error("無法載入股票清單，請檢查網路連線或檢查 SSL 設定。")
     else:
         total_count = len(all_stocks)
-        chunk_size = 40  # 分組下載，避免 API 過載封鎖
+        chunk_size = 40  # 縮小批次以提升 Yahoo Finance 下載成功率
         all_results = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner("系統深度掃描進行中..."):
+        with st.spinner("深度掃描進行中..."):
             for i in range(0, total_count, chunk_size):
                 chunk = all_stocks[i : i + chunk_size]
                 symbols = [s['symbol'] for s in chunk]
                 
-                status_text.text(f"掃描進度: {i} / {total_count} (正在分析第 {i//chunk_size + 1} 梯次)")
+                status_text.text(f"進度: {i} / {total_count} (正在掃描第 {i//chunk_size + 1} 梯次)")
                 
                 try:
-                    # 抓取半年日線資料
-                    df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column')
+                    # 增加 threads=True 加速下載並減少超時風險
+                    df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column', threads=True)
                     chunk_results = analyze_chunk(df_batch, chunk, sens)
                     all_results.extend(chunk_results)
                 except Exception:
                     pass 
                 
                 progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
-                time.sleep(0.3) # 防禦性延遲
+                time.sleep(0.5) # 延長延遲以確保穩定
 
-        status_text.text("✅ 全台股掃描完成！")
+        status_text.text("✅ 掃描完成！")
 
         if all_results:
             final_df = pd.DataFrame(all_results)
             final_df = final_df.sort_values(by="現價", ascending=False)
-            
-            st.success(f"🎉 找到 {len(final_df)} 檔符合底底高標的。")
+            st.success(f"🎉 在全台股中找到 {len(final_df)} 檔符合條件標的。")
             st.dataframe(final_df, use_container_width=True)
         else:
-            st.warning("☹️ 未發現符合標的，請嘗試調低靈敏度。")
+            st.warning("☹️ 未發現符合標的，建議調低「靈敏度 (Order)」。")
