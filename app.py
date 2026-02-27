@@ -5,7 +5,7 @@ from scipy.signal import argrelextrema
 import numpy as np
 
 # 頁面基礎設定
-st.set_page_config(page_title="2026 台股趨勢加速篩選器", layout="wide")
+st.set_page_config(page_title="2026 台股趨勢專業掃描器", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_all_stocks():
@@ -19,96 +19,106 @@ def get_all_stocks():
             name = str(row['name'])
             if len(code) == 4:
                 suffix = ".TW" if row['market'] == 'sii' else ".TWO"
-                stocks.append({"label": f"{name}", "code": code, "symbol": f"{code}{suffix}"})
+                stocks.append({"label": name, "code": code, "symbol": f"{code}{suffix}"})
         return stocks
     except:
-        # 備援清單：主要權值股
-        data = {"2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2308":"台達電", "2382":"廣達"}
+        # 權值股備援清單
+        data = {"2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2308":"台達電", "2382":"廣達", "2881":"富邦金", "2882":"國泰金", "2891":"中信金"}
         return [{"label": name, "code": code, "symbol": f"{code}.TW"} for code, name in data.items()]
 
-def analyze_batch(df_all, symbols, order):
-    """批次分析邏輯：處理下載後的資料並計算建議價位"""
+def analyze_batch(df_all, selected_stocks, order):
+    """批次分析邏輯：精準處理 MultiIndex 並計算建議價位"""
     results = []
-    for symbol in symbols:
+    
+    # 檢查下載的資料結構
+    if df_all.empty or 'Close' not in df_all:
+        return results
+
+    for s in selected_stocks:
+        symbol = s['symbol']
         try:
-            if symbol not in df_all['Close']: continue
-            df = df_all['Close'][symbol].dropna()
-            if len(df) < 40: continue
+            # 確保從 MultiIndex 中正確提取該股的收盤價
+            if symbol not in df_all['Close'].columns:
+                continue
+                
+            series = df_all['Close'][symbol].dropna()
+            if len(series) < 40:
+                continue
             
-            prices = df.values.flatten()
-            low_idx = argrelextrema(prices, np.less, order=order)
-            if len(low_idx) < 2: continue
+            prices = series.values
+            # 尋找局部低點
+            low_idx = argrelextrema(prices, np.less, order=order)[0]
+            
+            if len(low_idx) < 2:
+                continue
             
             last_low = float(prices[low_idx[-1]])
             prev_low = float(prices[low_idx[-2]])
             curr_price = float(prices[-1])
-            ma20 = float(df.rolling(20).mean().iloc[-1])
             
-            # 趨勢篩選：底底高 + 站上 20MA
+            # 計算 20MA
+            ma20 = float(series.rolling(20).mean().iloc[-1])
+            
+            # 核心邏輯：底底高 + 股價站上 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
-                    "代號": symbol.split('.')[0],
+                    "股票名稱": s['label'],
+                    "代號": s['code'],
                     "現價": round(curr_price, 2),
+                    "建議買進": round(last_low * 1.01, 2),
+                    "建議賣出": round(curr_price * 1.10, 2),
                     "支撐價位": round(last_low, 2),
-                    "建議買進": round(last_low * 1.01, 2), # 支撐位上浮 1%
-                    "建議賣出": round(curr_price * 1.10, 2), # 現價獲利 10% 預估
-                    "漲幅空間": f"{round((curr_price/last_low-1)*100, 1)}%"
+                    "幅度": f"{round((curr_price/last_low-1)*100, 1)}%"
                 })
-        except:
+        except Exception:
             continue
+            
     return results
 
 # --- UI 介面 ---
 st.title("⚡ TW 2026 台股趨勢自動掃描系統 (專業版)")
-st.markdown("採用 **yfinance 批次模式**，自動計算**買進/賣出建議價位**。")
+st.markdown("採用 **yfinance 批次模式**，自動計算買進/賣出建議價位。")
 
 with st.sidebar:
     st.header("設定參數")
-    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 10)
-    limit = st.number_input("掃描數量 (建議 50-200)", 10, 1000, 100)
+    sens = st.slider("趨勢靈敏度 (Order)", 5, 20, 10, help="Order 越大，篩選出的轉折點越顯著。若找不到標的，請調低此數值。")
+    limit = st.number_input("掃描數量 (建議 50-200)", 10, 1000, 50)
     start_btn = st.button("🚀 開始高速掃描")
 
 if start_btn:
-    with st.status("🚀 執行趨勢掃描中...", expanded=True) as status:
+    with st.status("🚀 執行高速掃描中...", expanded=True) as status:
+        st.write("📋 正在初始化股票清單...")
         all_stocks = get_all_stocks()
         selected_stocks = all_stocks[:int(limit)]
         symbols = [s['symbol'] for s in selected_stocks]
         
-        st.write(f"📥 正在批次下載 {len(symbols)} 檔資料並計算建議價位...")
+        st.write(f"📥 正在下載 {len(symbols)} 檔資料並分析趨勢...")
+        # 下載資料
         df_all = yf.download(symbols, period="6mo", progress=False, group_by='column')
         
-        analysis_results = analyze_batch(df_all, symbols, sens)
+        # 執行批次分析
+        final_results = analyze_batch(df_all, selected_stocks, sens)
         
-        final_results = []
-        name_map = {s['code']: s['label'] for s in selected_stocks}
-        for res in analysis_results:
-            res['股票名稱'] = name_map.get(res['代號'], "未知")
-            final_results.append(res)
-            
         status.update(label="✅ 掃描任務完成！", state="complete", expanded=False)
 
     if final_results:
         final_df = pd.DataFrame(final_results)
-        
-        # 1. 依據現價由高到低排序
+        # 依價位由高到低排序
         final_df = final_df.sort_values(by="現價", ascending=False)
         
-        # 2. 重新排列顯示欄位，符合您的抬頭需求
-        display_columns = ['股票名稱', '代號', '現價', '建議買進', '建議賣出', '支撐價位', '漲幅空間']
-        final_df = final_df[display_columns]
+        st.success(f"🎉 在 {len(selected_stocks)} 檔中找到 {len(final_df)} 檔符合條件標的！")
         
-        st.success(f"🎉 找到 {len(final_df)} 檔符合條件標的！(已依現價高低排序)")
-        
-        # 3. 顯示表格 (可下載 CSV)
+        # 欄位重新排序與抬頭顯示
+        display_cols = ['股票名稱', '代號', '現價', '建議買進', '建議賣出', '支撐價位', '幅度']
         st.dataframe(
-            final_df, 
+            final_df[display_cols], 
             use_container_width=True,
             column_config={
                 "現價": st.column_config.NumberColumn(format="%.2f"),
-                "建議買進": st.column_config.NumberColumn(help="支撐位附近進場較安全", format="%.2f"),
-                "建議賣出": st.column_config.NumberColumn(help="預設短線目標獲利 10%", format="%.2f"),
+                "建議買進": st.column_config.NumberColumn(format="%.2f", help="參考支撐價位上浮 1%"),
+                "建議賣出": st.column_config.NumberColumn(format="%.2f", help="預估短線獲利 10%"),
                 "支撐價位": st.column_config.NumberColumn(format="%.2f")
             }
         )
     else:
-        st.warning("☹️ 未找到符合條件標的，建議增加掃描數量或調整靈敏度。")
+        st.warning("☹️ 未找到符合條件標的，建議**增加掃描數量**或將**靈敏度 (Order) 調低**（例如 5-8）。")
