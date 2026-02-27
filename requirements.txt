@@ -6,3 +6,4 @@ scipy
 lxml
 numpy
 plotly
+html5lib
