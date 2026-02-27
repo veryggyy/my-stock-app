@@ -3,52 +3,54 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import time
-import os
 from datetime import datetime
 
-# --- 1. 頁面設定 ---
-st.set_page_config(page_title="2026 精準波段 SOP 掃描器", layout="wide")
+# --- 1. 頁面與手機版大字體 CSS 設定 ---
+st.set_page_config(page_title="2026 SOP 掃描器", layout="centered") # 手機建議 centered
 
-# 自定義手機版 CSS (隱藏不必要的空白)
 st.markdown("""
     <style>
-    [data-testid="stMetricValue"] { font-size: 1.8rem; }
-    .stProgress > div > div > div > div { background-color: #00ffcc; }
+    /* 全域字體放大 */
+    html, body, [class*="css"] { font-size: 1.1rem; }
+    h1 { font-size: 2.2rem !important; }
+    h3 { font-size: 1.8rem !important; color: #FFD700; } /* 股票名稱 */
+    
+    /* 讓 Metric (價格) 更醒目 */
+    [data-testid="stMetricValue"] { font-size: 2.5rem !important; font-weight: 700; }
+    
+    /* 強化卡片視覺 */
+    div[data-testid="stVerticalBlock"] > div[style*="border"] {
+        border: 2px solid #4B5563 !important;
+        border-radius: 15px !important;
+        padding: 20px !important;
+        background-color: #1F2937 !important;
+        margin-bottom: 15px !important;
+    }
+    
+    /* 進度條顏色 */
+    .stProgress > div > div > div > div { background-image: linear-gradient(to right, #4facfe 0%, #00f2fe 100%); }
     </style>
 """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=3600)
 def get_stock_list():
-    # 內建台灣前 20 大權值股，確保沒檔案也能跑
-    default_list = {
+    # 內建 2026 關鍵權值與 AI 供應鏈
+    return {
         "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", 
-        "2308.TW": "台達電", "2382.TW": "廣達", "2881.TW": "富邦金",
-        "2882.TW": "國泰金", "2303.TW": "聯電", "3711.TW": "日月光",
-        "2412.TW": "中華電", "2886.TW": "兆豐金", "2603.TW": "長榮",
-        "3008.TW": "大立光", "2357.TW": "華碩", "3231.TW": "緯創"
+        "2308.TW": "台達電", "2382.TW": "廣達", "3231.TW": "緯創",
+        "2357.TW": "華碩", "3711.TW": "日月光", "2603.TW": "長榮",
+        "2881.TW": "富邦金", "2882.TW": "國泰金", "2408.TW": "南亞科"
     }
-    cache_file = "taiwan_stock_list.csv"
-    if os.path.exists(cache_file):
-        try:
-            df = pd.read_csv(cache_file, dtype=str, encoding='utf-8-sig')
-            c_col = next((c for c in df.columns if any(k in c for k in ['Symbol', '代號', 'code'])), df.columns[0])
-            n_col = next((c for c in df.columns if any(k in c for k in ['Name', '名稱', 'label'])), df.columns[1])
-            return {f"{str(row[c_col]).strip()[:4]}.TW": str(row[n_col]).strip() for _, row in df.iterrows()}
-        except: return default_list
-    return default_list
 
-# --- 2. 核心 SOP 分析引擎 ---
+# --- 2. 核心分析引擎 (加入優先級邏輯) ---
 def analyze_2026_sop(df, vol_mult):
     if df is None or len(df) < 60: return None
     
-    # 計算指標
     df['MA20'] = ta.sma(df['Close'], length=20)
     df['MA60'] = ta.sma(df['Close'], length=60)
     df['VMA20'] = ta.sma(df['Volume'], length=20)
-    
     macd = ta.macd(df['Close'])
     df['MACD_h'] = macd['MACDh_12_26_9']
-    
     kd = ta.stoch(df['High'], df['Low'], df['Close'])
     df['K'] = kd['STOCHk_14_3_3']
     df['D'] = kd['STOCHd_14_3_3']
@@ -56,107 +58,94 @@ def analyze_2026_sop(df, vol_mult):
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 【SOP 條件】
-    # 1. 趨勢：站穩 20/60MA
+    # 基本門檻：站穩月線與季線
     is_bullish = curr['Close'] > curr['MA20'] and curr['Close'] > curr['MA60']
-    
-    # 2. 進場 A：帶量 + MACD 轉正 (放寬判斷：轉正或是正值剛開始放大)
-    is_breakout = (curr['Volume'] > curr['VMA20'] * vol_mult) and \
-                  ((curr['MACD_h'] > 0 >= prev['MACD_h']) or (curr['MACD_h'] > prev['MACD_h'] > 0))
-    
-    # 3. 進場 B：KD 低檔金叉 (K < 35)
-    is_kd_cross = (prev['K'] < 35) and (curr['K'] > curr['D']) and (prev['K'] <= prev['D'])
+    if not is_bullish: return None
 
-    if is_bullish and (is_breakout or is_kd_cross):
+    # 訊號 A：帶量攻擊 (優先權最高)
+    is_breakout = (curr['Volume'] > curr['VMA20'] * vol_mult) and (curr['MACD_h'] > prev['MACD_h'])
+    
+    # 訊號 B：KD 金叉 (優先權次之)
+    is_kd_cross = (prev['K'] < 40) and (curr['K'] > curr['D']) and (prev['K'] <= prev['D'])
+
+    if is_breakout or is_kd_cross:
+        # 計算權重：1 為最優 (帶量且金叉), 2 為帶量, 3 為單純金叉
+        rank = 1 if (is_breakout and is_kd_cross) else (2 if is_breakout else 3)
         return {
-            "型態": "🚀 帶量轉強" if is_breakout else "🎯 KD 低檔金叉",
+            "優劣": rank,
+            "標籤": "🔥 極強訊號" if rank == 1 else ("🚀 帶量攻擊" if rank == 2 else "🎯 回測金叉"),
             "現價": round(curr['Close'], 2),
-            "MA20": round(curr['MA20'], 2),
-            "量能": f"{round(curr['Volume']/curr['VMA20'], 1)}x",
-            "KD值": f"K:{int(curr['K'])}",
-            "防守點": round(min(curr['MA20'], curr['Low'] * 0.98), 2),
-            "優先級": 1 if is_breakout else 2
+            "漲跌": round(curr['Close'] - prev['Close'], 2),
+            "量比": round(curr['Volume']/curr['VMA20'], 1),
+            "KD": int(curr['K']),
+            "支撐": round(curr['MA20'], 1)
         }
     return None
 
-# --- 3. UI 介面 ---
-st.title("⚡ 2026 SOP 掃描器")
-st.caption(f"📅 當前時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+# --- 3. 手機版 UI ---
+st.title("⚡ 2026 SOP 掃描")
+st.write(f"📅 {datetime.now().strftime('%m/%d %H:%M')} | 直式操作模式")
 
 stock_dict = get_stock_list()
 symbols = list(stock_dict.keys())
 
-with st.sidebar:
-    st.header("⚙️ 掃描設定")
-    vol_target = st.slider("成交量倍數門檻", 0.5, 3.0, 1.0, 0.1)
-    st.info("💡 若找不到標的，請將門檻調低至 0.8~1.0")
-    if st.button("🔄 清除快取"):
-        st.cache_data.clear()
-    start_btn = st.button("🚀 開始掃描", use_container_width=True)
+with st.expander("🛠️ 參數調整 (手機點選)"):
+    vol_target = st.slider("成交量門檻", 0.5, 2.5, 1.0, 0.1)
+    if st.button("🔄 重置快取"): st.cache_data.clear()
 
-if start_btn:
+if st.button("🚀 開始掃描全台股", use_container_width=True):
     results = []
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    
+    msg_box = st.empty()
+    bar_box = st.empty()
     start_time = time.time()
     
-    # 批次下載數據
-    with st.spinner('連線 Yahoo Finance 下載數據中...'):
-        data = yf.download(symbols, period="6mo", group_by='ticker', threads=True, progress=False)
+    data = yf.download(symbols, period="6mo", group_by='ticker', threads=True, progress=False)
     
     total = len(symbols)
     for idx, (sym, name) in enumerate(stock_dict.items()):
-        # 計算進度百分比與 ETA
-        processed = idx + 1
-        percent = int((processed / total) * 100)
-        elapsed = time.time() - start_time
-        eta = int((elapsed / processed) * (total - processed)) if processed > 0 else 0
+        pct = int(((idx+1)/total)*100)
+        eta = int(((time.time()-start_time)/(idx+1))*(total-(idx+1))) if idx > 0 else 0
         
-        status_text.markdown(f"**掃描進度：{percent}%** | 預計剩餘：`{eta}` 秒")
-        progress_bar.progress(processed / total)
+        msg_box.markdown(f"### ⏳ 進度: {pct}% \n**預計剩餘: {eta} 秒**")
+        bar_box.progress((idx+1)/total)
         
         try:
-            # 取得該股 DataFrame
-            if total > 1:
-                stock_df = data[sym].dropna()
-            else:
-                stock_df = data.dropna()
-                
-            res = analyze_2026_sop(stock_df, vol_target)
+            df = data[sym].dropna()
+            res = analyze_2026_sop(df, vol_target)
             if res:
                 res["股票"] = f"{sym.split('.')[0]} {name}"
                 results.append(res)
         except: continue
 
-    status_text.success(f"✅ 掃描完成！費時 {int(time.time() - start_time)} 秒")
+    msg_box.empty()
+    bar_box.empty()
 
-    # --- 4. 手機優化結果呈現 ---
+    # --- 4. 結果呈現 (依優劣排序) ---
     if results:
-        st.subheader(f"🎯 符合 SOP 標的 ({len(results)})")
-        # 按優先級排序
-        sorted_results = sorted(results, key=lambda x: x['優先級'])
+        # 按 '優劣' 排序 (數字越小越前面)
+        sorted_res = sorted(results, key=lambda x: x['優劣'])
         
-        for item in sorted_results:
+        st.success(f"找到 {len(sorted_res)} 檔優質標的")
+        
+        for item in sorted_res:
             with st.container(border=True):
-                # 第一欄：股票名稱與訊號
-                col1, col2 = st.columns([2, 1])
-                with col1:
-                    st.markdown(f"### {item['股票']}")
-                    st.write(f"**{item['型態']}**")
-                with col2:
-                    st.metric("現價", item['現價'])
+                # 標題與訊號標籤
+                st.markdown(f"### {item['股票']}")
+                if item['優劣'] == 1:
+                    st.error(f"【{item['標籤']}】優先關注") # 用紅色強調
+                else:
+                    st.info(f"【{item['標籤']}】")
                 
-                # 第二欄：關鍵數據
-                d1, d2, d3 = st.columns(3)
-                d1.caption("📊 量能")
-                d1.write(f"`{item['量能']}`")
-                d2.caption("📈 KD值")
-                d2.write(f"`{item['KD值']}`")
-                d3.caption("🛡️ 防守")
-                d3.write(f"**{item['防守點']}**")
+                # 價格大數字
+                st.metric("目前股價", f"{item['現價']} 元", f"{item['漲跌']} 元")
+                
+                # 詳細數據 (直式清單)
+                st.write(f"📊 **量能倍數：** `{item['量比']}x`")
+                st.write(f"📈 **K 值水準：** `{item['KD']}`")
+                st.write(f"🛡️ **支撐(月線)：** `{item['支撐']}`")
+                st.write(f"🛡️ **建議停損：** `{round(item['現價']*0.95, 1)}` (5%)")
     else:
-        st.warning("⚠️ 目前無符合條件之標的。建議調低「成交量倍數門檻」或檢查網路連線。")
+        st.warning("當前暫無符合 SOP 標的，請降低量能門檻再試。")
 
 st.divider()
-st.caption("⚠ 免責聲明：本工具僅供 2026 技術分析參考，投資請嚴格執行停損。")
+st.caption("⚠ 技術分析僅供參考，2026 投資請嚴格執行停損。")
