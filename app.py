@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
+import time  # 新增：用於計算剩餘時間
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="2026 台股趨勢波段掃描器", layout="wide")
@@ -16,7 +17,6 @@ def get_stock_list():
     if not os.path.exists(cache_file): return fallback
     
     try:
-        # 編碼容錯處理
         for enc in ['utf-8-sig', 'big5', 'gbk']:
             try:
                 df = pd.read_csv(cache_file, dtype=str, encoding=enc)
@@ -34,22 +34,19 @@ def get_stock_list():
         return {f"{row['clean_code']}.TW": str(row[name_col]).strip() for _, row in df.iterrows()}
     except: return fallback
 
-# --- 2. 核心技術分析 (20MA/60MA 多頭 + MACD 邏輯) ---
+# --- 2. 核心技術分析 ---
 def analyze_trend_strategy(data, symbol, name):
     try:
         if data is None or len(data) < 70: return None
         
         df = data.copy()
-        # 處理 yfinance 多層 Index
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
-        # 技術指標計算
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['VMA20'] = df['Volume'].rolling(window=20).mean()
         
-        # MACD (12, 26, 9)
         ema12 = df['Close'].ewm(span=12, adjust=False).mean()
         ema26 = df['Close'].ewm(span=26, adjust=False).mean()
         macd_line = ema12 - ema26
@@ -59,14 +56,9 @@ def analyze_trend_strategy(data, symbol, name):
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # --- 策略門檻 ---
-        # 1. 多頭排列環境：20MA > 60MA
         if not (curr['MA20'] > curr['MA60']): return None
 
-        # 2. 進場判定
-        # A. 帶量突破 (收盤 > 昨日高點 且 量 > 1.5倍均量)
         is_breakout = (curr['Close'] > prev['High']) and (curr['Volume'] > curr['VMA20'] * 1.5)
-        # B. 回測支撐 (股價回落月線附近 且 MACD 紅柱)
         is_support = (curr['Low'] <= curr['MA20'] * 1.02) and (curr['Close'] >= curr['MA20'] * 0.99) and (hist.iloc[-1] > 0)
 
         if is_breakout or is_support:
@@ -104,37 +96,44 @@ with st.sidebar:
 if start_btn:
     all_results = []
     progress_bar = st.progress(0)
+    status_text = st.empty() # 動態顯示進度文字
     
-    with st.spinner(f"正在安全下載並分析 {len(symbols)} 檔台股..."):
-        try:
-            # 關鍵修正：threads=False 解決 Python 3.13 的 RuntimeError
+    start_time = time.time() # 紀錄開始時間
+    
+    try:
+        # 下載數據
+        with st.spinner("📦 正在從 Yahoo Finance 下載數據..."):
             raw_data = yf.download(symbols, period="8mo", group_by='ticker', threads=False, progress=False)
-            
-            for idx, (sym, name) in enumerate(stock_dict.items()):
-                try:
-                    # 抓取單一股票資料 (修正多股下載後的索引提取)
-                    if len(symbols) > 1:
-                        stock_df = raw_data[sym]
-                    else:
-                        stock_df = raw_data
-                        
-                    if stock_df.empty or len(stock_df) < 60: continue
-                    
-                    res = analyze_trend_strategy(stock_df, sym, name)
-                    if res: all_results.append(res)
-                except: continue
+        
+        # 逐檔分析
+        total = len(symbols)
+        for idx, (sym, name) in enumerate(stock_dict.items()):
+            try:
+                stock_df = raw_data[sym] if len(symbols) > 1 else raw_data
+                if stock_df.empty or len(stock_df) < 60: continue
                 
-                if idx % 50 == 0: 
-                    progress_bar.progress(min((idx + 1) / len(symbols), 1.0))
-            progress_bar.progress(1.0)
+                res = analyze_trend_strategy(stock_df, sym, name)
+                if res: all_results.append(res)
+            except: continue
             
-        except Exception as e:
-            st.error(f"掃描中斷: {e}")
+            # 更新進度條與預估時間
+            processed = idx + 1
+            percent = processed / total
+            elapsed_time = time.time() - start_time
+            avg_time_per_stock = elapsed_time / processed
+            remaining_time = avg_time_per_stock * (total - processed)
+            
+            progress_bar.progress(percent)
+            status_text.text(f"🚀 進度: {percent:.1%} ({processed}/{total}) | 預計剩餘時間: {remaining_time:.0f} 秒")
+        
+        status_text.success(f"✅ 掃描完成！總耗時: {time.time() - start_time:.1f} 秒")
+        
+    except Exception as e:
+        st.error(f"掃描中斷: {e}")
 
     if all_results:
         st.success(f"發現 {len(all_results)} 檔符合策略標的")
         
-        # 技術解釋抬頭
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("#### 🟢 型態解釋")
@@ -143,19 +142,17 @@ if start_btn:
         with col2:
             st.markdown("#### 🔴 MACD 指標")
             st.caption("🔴 **紅柱**：多方動能增強。")
-            st.caption("🟢 **綠柱**：多方動能衰退。")
         with col3:
             st.markdown("#### 📊 成交量")
             st.caption("🔥 **爆量**：大於 20 日均量 1.5 倍。")
-            st.caption("⚪ **正常**：量能維持常規。")
         
         st.divider()
         
-        # 顯示結果表格
-        df_res = pd.DataFrame(all_results).sort_values(by="現價", ascending=True)
+        # 顯示結果表格，依型態與現價排序，讓買進訊號最明確的靠前
+        df_res = pd.DataFrame(all_results).sort_values(by=["型態", "現價"], ascending=[False, True])
         st.dataframe(df_res, use_container_width=True, hide_index=True)
     else:
         st.warning("查無符合多頭排列與進場條件的股票。")
 
 st.markdown("---")
-st.caption("修復記錄：已關閉多執行緒下載以相容 Python 3.13 環境，並增加欄位正確性校驗。")
+st.caption("修復紀錄：已加入即時預估時間演算法，並優化結果排列順序。")
