@@ -10,33 +10,52 @@ st.set_page_config(page_title="2026 全台股趨勢終極掃描器", layout="wid
 
 @st.cache_data(ttl=86400)
 def get_full_taiwan_stock_list():
-    """取得完整的全台股清單 (上市+上櫃)"""
+    """從證交所與櫃買中心獲取最新完整股票清單"""
+    stocks = []
     try:
-        # 使用 GitHub 穩定來源，抓取所有台股編號
-        url = "https://raw.githubusercontent.com"
-        df = pd.read_csv(url)
-        stocks = []
-        for _, row in df.iterrows():
-            code = str(row['code'])
-            name = str(row['name'])
-            # 篩選 4 碼普通股
-            if len(code) == 4:
-                suffix = ".TW" if row['market'] == 'sii' else ".TWO"
-                stocks.append({"label": name, "code": code, "symbol": f"{code}{suffix}"})
+        # 1. 抓取上市股票清單 (SII)
+        url_sii = "https://isin.twse.com.tw"
+        # 2. 抓取上櫃股票清單 (OTC)
+        url_otc = "https://isin.twse.com.tw"
+        
+        for url, market_type in [(url_sii, ".TW"), (url_otc, ".TWO")]:
+            # 讀取 HTML 表格
+            df_list = pd.read_html(url)
+            df = df_list[0]
+            
+            # 整理格式
+            df.columns = df.iloc[0] # 設定第一行為欄位名
+            df = df.iloc[2:] # 跳過標題行
+            
+            for item in df['有價證券代號及名稱']:
+                if pd.isna(item): continue
+                # 原始資料格式為 "2330　台積電" (中間有全型空格)
+                parts = item.replace('　', ' ').split(' ')
+                if len(parts) >= 2:
+                    code = parts[0]
+                    name = parts[1]
+                    # 篩選 4 碼普通股
+                    if len(code) == 4:
+                        stocks.append({
+                            "label": name, 
+                            "code": code, 
+                            "symbol": f"{code}{market_type}"
+                        })
         return stocks
     except Exception as e:
-        st.error(f"清單獲取失敗: {e}")
+        st.error(f"清單獲取失敗，錯誤回報: {e}")
         return []
 
 def analyze_chunk(df_chunk, selected_stocks_chunk, order):
     """分析一組批次資料"""
     results = []
-    if df_chunk.empty or 'Close' not in df_chunk:
+    if df_chunk.empty:
         return results
 
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
+            # 處理多重索引 (Multi-index) 的 yfinance 資料
             if symbol not in df_chunk['Close'].columns:
                 continue
                 
@@ -44,6 +63,7 @@ def analyze_chunk(df_chunk, selected_stocks_chunk, order):
             if len(series) < 40: continue
             
             prices = series.values
+            # 尋找局部極小值
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             
             if len(low_idx) < 2: continue
@@ -53,7 +73,7 @@ def analyze_chunk(df_chunk, selected_stocks_chunk, order):
             curr_price = float(prices[-1])
             ma20 = float(series.rolling(20).mean().iloc[-1])
             
-            # 趨勢邏輯：底底高 + 站上 20MA
+            # 趨勢邏輯：底底高 (Higher Low) + 站上 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'],
@@ -82,50 +102,43 @@ if start_btn:
     all_stocks = get_full_taiwan_stock_list()
     
     if not all_stocks:
-        st.error("無法載入股票清單。")
+        st.error("無法載入股票清單，請檢查網路連線。")
     else:
         total_count = len(all_stocks)
-        chunk_size = 100 # 每組下載 100 檔，避免被 Yahoo 封鎖
+        chunk_size = 50 # 縮小批次以提高穩定性
         all_results = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 開始分批掃描
         with st.spinner("深度掃描進行中..."):
             for i in range(0, total_count, chunk_size):
                 chunk = all_stocks[i : i + chunk_size]
                 symbols = [s['symbol'] for s in chunk]
                 
-                status_text.text(f"正在掃描區段: {i} ~ {min(i+chunk_size, total_count)} (總計 {total_count} 檔)")
+                status_text.text(f"正在掃描: {i} ~ {min(i+chunk_size, total_count)} / 總計 {total_count} 檔")
                 
-                # 批次下載
                 try:
+                    # 下載半年資料
                     df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column')
-                    # 執行分析
                     chunk_results = analyze_chunk(df_batch, chunk, sens)
                     all_results.extend(chunk_results)
                 except Exception as e:
-                    st.warning(f"區段 {i} 抓取異常，已跳過。")
+                    pass # 略過異常區段
                 
-                # 更新進度條
                 progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
-                # 稍微延遲避免請求過快
-                time.sleep(0.5)
+                time.sleep(0.2) # 短暫休眠避免 API 請求限制
 
         status_text.text("✅ 全台股深度掃描完成！")
 
         if all_results:
             final_df = pd.DataFrame(all_results)
-            # 依價位排序
             final_df = final_df.sort_values(by="現價", ascending=False)
             
             st.success(f"🎉 掃描完畢！在全台股中找到 {len(final_df)} 檔符合條件標的。")
             
-            # 顯示表格
-            display_cols = ['股票名稱', '代號', '現價', '建議買進', '建議賣出', '支撐價位', '幅度']
             st.dataframe(
-                final_df[display_cols], 
+                final_df, 
                 use_container_width=True,
                 column_config={
                     "現價": st.column_config.NumberColumn(format="%.2f"),
@@ -135,5 +148,4 @@ if start_btn:
                 }
             )
         else:
-            st.warning("☹️ 掃描全台股後未發現符合條件標的，請嘗試調低「靈敏度 (Order)」。")
-
+            st.warning("☹️ 掃描全台股後未發現符合條件標的，建議調低「趨勢靈敏度」。")
