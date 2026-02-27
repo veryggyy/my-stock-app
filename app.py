@@ -6,7 +6,7 @@ import numpy as np
 import time
 import ssl
 
-# --- 核心修復：跳過 SSL 憑證驗證，解決證交所連線報錯 ---
+# --- 核心修復：忽略 SSL 憑證驗證，解決證交所連線報錯 ---
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # 頁面基礎設定
@@ -26,9 +26,9 @@ def get_full_taiwan_stock_list():
         for url, suffix in urls:
             # 讀取 HTML 表格 (需安裝 lxml: pip install lxml)
             df_list = pd.read_html(url)
-            df = df_list[0]
+            df = df_list[0] # 取得主表格
             
-            # 整理格式
+            # 整理格式：設定欄位並跳過標題行
             df.columns = df.iloc[0]
             df = df.iloc[1:]
             
@@ -68,7 +68,7 @@ def analyze_chunk(df_chunk, selected_stocks_chunk, order):
             if len(series) < 40: continue
             
             prices = series.values
-            # 尋找波段低點
+            # 尋找波段低點 (局部極小值)
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             
             if len(low_idx) < 2: continue
@@ -78,7 +78,7 @@ def analyze_chunk(df_chunk, selected_stocks_chunk, order):
             curr_price = float(prices[-1])
             ma20 = float(series.rolling(20).mean().iloc[-1])
             
-            # 條件：最新低點 > 前一低點 (底底高) 且 現價 > 20MA
+            # 策略條件：最新低點 > 前一低點 (底底高) 且 現價 > 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'],
@@ -86,7 +86,7 @@ def analyze_chunk(df_chunk, selected_stocks_chunk, order):
                     "現價": round(curr_price, 2),
                     "支撐價位": round(last_low, 2),
                     "建議買點": round(last_low * 1.01, 2),
-                    "幅度": f"{round((curr_price/last_low-1)*100, 1)}%"
+                    "偏離度": f"{round((curr_price/last_low-1)*100, 1)}%"
                 })
         except:
             continue
@@ -109,13 +109,13 @@ if start_btn:
         st.error("無法載入股票清單，請檢查網路連線。")
     else:
         total_count = len(all_stocks)
-        chunk_size = 50 # 每組下載 50 檔，降低 API 負擔
+        chunk_size = 40 # 每組下載 40 檔，降低 API 封鎖機率
         all_results = []
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner("系統深度掃描進行中..."):
+        with st.spinner("系統深度掃描中，請稍候..."):
             for i in range(0, total_count, chunk_size):
                 chunk = all_stocks[i : i + chunk_size]
                 symbols = [s['symbol'] for s in chunk]
@@ -123,7 +123,7 @@ if start_btn:
                 status_text.text(f"掃描進度: {i} / {total_count} (正在分析第 {i//chunk_size + 1} 梯次)")
                 
                 try:
-                    # 批次下載
+                    # 下載 6 個月歷史資料
                     df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column')
                     chunk_results = analyze_chunk(df_batch, chunk, sens)
                     all_results.extend(chunk_results)
@@ -131,15 +131,15 @@ if start_btn:
                     pass 
                 
                 progress_bar.progress(min((i + chunk_size) / total_count, 1.0))
-                time.sleep(0.3)
+                time.sleep(0.3) # 防禦性延遲
 
         status_text.text("✅ 全台股深度掃描完成！")
 
         if all_results:
             final_df = pd.DataFrame(all_results)
-            final_df = final_df.sort_values(by="現價", ascending=False)
+            final_df = final_df.sort_values(by="偏離度")
             
             st.success(f"🎉 掃描完畢！在全台股中找到 {len(final_df)} 檔符合條件標的。")
             st.dataframe(final_df, use_container_width=True)
         else:
-            st.warning("☹️ 掃描後未發現符合條件標的，請嘗試調低「趨勢靈敏度」。")
+            st.warning("☹️ 掃描後未發現符合條件標的，建議調低「趨勢靈敏度 (Order)」。")
