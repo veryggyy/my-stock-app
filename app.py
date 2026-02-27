@@ -8,7 +8,7 @@ import ssl
 import requests
 from io import StringIO
 
-# --- 核心修復：忽略 SSL 憑證並停用警告 ---
+# --- 核心修復：全域忽略 SSL 驗證 ---
 ssl._create_default_https_context = ssl._create_unverified_context
 requests.packages.urllib3.disable_warnings()
 
@@ -24,15 +24,14 @@ def get_full_taiwan_stock_list():
         ("https://isin.twse.com.tw", ".TWO") # 上櫃
     ]
     
-    # 模擬 Chrome 瀏覽器 Header，避免被伺服器拒絕
+    # 模擬 Chrome 瀏覽器 Header，避免被伺服器阻擋
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     }
 
     try:
         for url, suffix in urls:
-            # 關鍵修正：先用 requests 抓取，指定編碼後再餵給 pandas
+            # 關鍵修正：先用 requests 抓取網頁內容
             response = requests.get(url, headers=headers, verify=False, timeout=15)
             response.encoding = 'big5' # 證交所使用 big5 編碼
             
@@ -41,7 +40,7 @@ def get_full_taiwan_stock_list():
             df_list = pd.read_html(html_data)
             
             if not df_list: continue
-            df = df_list[0]
+            df = df_list[0] # 取得主表格
             
             # 整理資料：設定欄位名
             df.columns = df.iloc[0]
@@ -49,11 +48,12 @@ def get_full_taiwan_stock_list():
             
             for item in df['有價證券代號及名稱']:
                 if pd.isna(item): continue
+                # 處理「代號 名称」格式: "2330　台積電"
                 parts = item.replace('　', ' ').split(' ')
                 if len(parts) >= 2:
                     code = parts[0]
                     name = parts[1]
-                    # 只抓取 4 碼純數字普通股
+                    # 篩選 4 碼純數字普通股 (排除權證、ETF)
                     if len(code) == 4 and code.isdigit():
                         stocks.append({"label": name, "code": code, "symbol": f"{code}{suffix}"})
         return stocks
@@ -70,19 +70,21 @@ def analyze_chunk(df_batch, selected_stocks_chunk, order):
     for s in selected_stocks_chunk:
         symbol = s['symbol']
         try:
-            # 檢查 yfinance 多重索引欄位
+            # 檢查 yfinance 抓回的資料中是否有該股 Close 欄位
             if symbol not in df_batch['Close'].columns:
                 continue
             series = df_batch['Close'][symbol].dropna()
             if len(series) < 40: continue
             
             prices = series.values
+            # 尋找波段低點
             low_idx = argrelextrema(prices, np.less, order=order)[0]
             if len(low_idx) < 2: continue
             
             last_low, prev_low, curr_price = float(prices[low_idx[-1]]), float(prices[low_idx[-2]]), float(prices[-1])
             ma20 = float(series.rolling(20).mean().iloc[-1])
             
+            # 條件：底底高 (Higher Low) 且 現價 > 20MA
             if last_low > prev_low and curr_price > ma20:
                 results.append({
                     "股票名稱": s['label'], "代號": s['code'], "現價": round(curr_price, 2),
@@ -119,7 +121,7 @@ if start_btn:
                 symbols = [s['symbol'] for s in chunk]
                 status_text.text(f"掃描進度: {i} / {total_count}")
                 try:
-                    # 使用多執行緒 threads=True 加速
+                    # 使用多執行緒加速
                     df_batch = yf.download(symbols, period="6mo", progress=False, group_by='column', threads=True)
                     all_results.extend(analyze_chunk(df_batch, chunk, sens))
                 except: pass
