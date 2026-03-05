@@ -43,38 +43,35 @@ def get_full_taiwan_list():
     except: pass
     return {"2330.TW": "台積電", "2317.TW": "鴻海"}, "⚠️ 使用內建保底清單"
 
-# --- 3. 核心 SOP 分析引擎 (強化穩定版) ---
+# --- 3. 核心 SOP 分析引擎 (強化結構解析) ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
     try:
         if df is None or len(df) < 30: return None
         
-        # 1. 數據清理：確保欄位首字母大寫並轉為浮點數
+        # 1. 統一欄位名稱並轉為浮點數
         df.columns = [str(c).capitalize() for c in df.columns]
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce').dropna()
+        cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
         
-        # 2. 計算 MA & Volume MA
+        # 2. 指標計算
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['VMA20'] = ta.sma(df['Volume'], length=20)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         
-        # 3. 計算 KD (使用標準 STOCH)
-        stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=14, d=3, smooth_k=3)
-        # 處理 pandas_ta 回傳的欄位名稱
-        k_col = [c for c in stoch.columns if 'STOCHk' in c][0]
-        d_col = [c for c in stoch.columns if 'STOCHd' in c][0]
-        
-        curr_k = stoch[k_col].iloc[-1]
-        curr_d = stoch[d_col].iloc[-1]
-        prev_k = stoch[k_col].iloc[-2]
+        # 3. KD 計算 (處理 pandas_ta 可能的隨機欄位名)
+        kd_df = ta.stoch(df['High'], df['Low'], df['Close'], k=14, d=3, smooth_k=3)
+        k_val = kd_df.iloc[-1, 0] # 取最後一列的第一欄 (K)
+        d_val = kd_df.iloc[-1, 1] # 取最後一列的第二欄 (D)
+        prev_k = kd_df.iloc[-2, 0] # 前一天的 K
         
         curr_p = df['Close'].iloc[-1]
         curr_v = df['Volume'].iloc[-1]
         vma = df['VMA20'].iloc[-1]
         ma20 = df['MA20'].iloc[-1]
         
-        # 4. 篩選條件：(帶量) 或 (KD金叉)
+        # 4. 篩選邏輯 (寬鬆版)
         is_vol = (curr_v > vma * vol_mult)
-        is_kd = (prev_k < kd_threshold) and (curr_k > curr_d)
+        is_kd = (prev_k < kd_threshold) and (k_val > d_val)
 
         if is_vol or is_kd:
             rank = 1 if (is_vol and is_kd) else (2 if is_vol else 3)
@@ -83,9 +80,9 @@ def analyze_sop_v4(df, vol_mult, kd_threshold):
                 "訊號": "🔥 帶量金叉" if rank == 1 else ("🚀 攻擊 (帶量)" if rank == 2 else "🎯 轉強 (金叉)"),
                 "現價": round(float(curr_p), 2),
                 "量比": round(float(curr_v / vma), 2),
-                "K值": int(curr_k),
+                "K值": int(k_val),
                 "建議買進": round(float(ma20), 2),
-                "波段賣出": round(float(curr_p + (df['ATR'].iloc[-1] * 2.2)), 2),
+                "波段賣出": round(float(curr_p + (df['ATR'].iloc[-1] * 2.1)), 2),
                 "關鍵支撐": round(float(min(ma20, df['Low'].iloc[-1])), 2)
             }
     except: return None
@@ -98,7 +95,7 @@ st.caption(f"📅 系統日期: {datetime.now().strftime('%Y-%m-%d')}")
 with st.sidebar:
     st.header("⚙️ 參數設定")
     vol_target = st.slider("1. 量能倍數", 0.1, 2.0, 0.5, 0.1)
-    kd_limit = st.slider("2. KD 門檻", 10, 90, 75, 5)
+    kd_limit = st.slider("2. KD 門檻", 10, 90, 80, 5)
     scan_limit = st.number_input("3. 掃描檔數", 10, 2800, 300)
     if st.button("🔄 清除快取並重啟"):
         st.cache_data.clear()
@@ -114,22 +111,22 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 下載數據：改為 30 檔一批
-    batch_size = 30 
+    # 分批下載：每次抓 20 檔，避免 MultiIndex 結構過於混亂
+    batch_size = 20 
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i : i + batch_size]
         status_text.text(f"正在分析 {i+1} ~ {min(i+batch_size, len(tickers))} 檔...")
         try:
-            # 獲取歷史數據
+            # 獲取數據
             data = yf.download(batch, period="4mo", group_by='ticker', auto_adjust=True, progress=False)
             
             for sym in batch:
                 try:
-                    # 處理多檔下載後的 DataFrame 提取
+                    # 強制提取對應股票的數據
                     if len(batch) > 1:
-                        df_target = data[sym].dropna()
+                        df_target = data[sym].copy().dropna()
                     else:
-                        df_target = data.dropna()
+                        df_target = data.copy().dropna()
                         
                     if len(df_target) < 25: continue
                     
