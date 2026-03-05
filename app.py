@@ -10,7 +10,7 @@ from datetime import datetime
 # 隱藏 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- 1. 頁面設定：優化手機顯示 ---
+# --- 1. 頁面設定 ---
 st.set_page_config(page_title="2026 三強共振 SOP 掃描", layout="centered")
 
 st.markdown("""
@@ -26,12 +26,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取全台股清單 (自動路徑修正版) ---
+# --- 2. 獲取全台股清單 (修正為 your GitHub ID: veryggyy) ---
 @st.cache_data(ttl=60)
 def get_full_taiwan_list():
     stocks = {}
     try:
-        # 直接定義正確的 raw 檔案路徑
+        # 強制修正網址為 your 正確路徑
         csv_url = f"https://raw.githubusercontent.com{int(time.time())}"
         resp = requests.get(csv_url, timeout=10)
         
@@ -42,20 +42,15 @@ def get_full_taiwan_list():
                 if len(parts) >= 2:
                     code = parts[0].strip().upper()
                     name = parts[1].strip()
-                    # 跳過標題列並確保格式正確
                     if "代號" not in code and len(code) >= 4:
                         if not (code.endswith('.TW') or code.endswith('.TWO')):
                             code = f"{code}.TW"
                         stocks[code] = name
-            
             if len(stocks) > 0:
                 return stocks, f"📡 已成功載入 CSV 股票清單 (共 {len(stocks)} 檔)"
-        else:
-            return {"2330.TW": "台積電", "2317.TW": "鴻海"}, f"⚠️ CSV 讀取失敗 (錯誤碼: {resp.status_code})"
+        return {"2330.TW": "台積電", "2317.TW": "鴻海"}, f"⚠️ CSV 讀取失敗 (代碼: {resp.status_code})"
     except Exception as e:
-        return {"2330.TW": "台積電", "2317.TW": "鴻海"}, f"⚠️ 連線異常: {str(e)}"
-    
-    return stocks, "📡 已成功載入清單"
+        return {"2330.TW": "台積電", "2317.TW": "鴻海"}, f"⚠️ 連線異常，請確認 GitHub 帳號是否正確"
 
 # --- 3. 核心 SOP 分析引擎 ---
 def analyze_sop_v5(df, up_threshold):
@@ -71,8 +66,6 @@ def analyze_sop_v5(df, up_threshold):
         df['VMA5'] = ta.sma(df['Volume'], length=5)
         
         curr, prev = df.iloc[-1], df.iloc[-2]
-        
-        # 條件：趨勢向上 + KD金叉 + 帶量漲幅
         is_trend = (curr['Close'] > curr['MA20']) and (curr['MA20_Slope'] > 0)
         is_kd_cross = (curr['K'] > curr['D']) and (prev['K'] <= prev['D'])
         ret = (curr['Close'] / prev['Close'] - 1) * 100
@@ -109,7 +102,6 @@ if st.button("🔵 開始執行『三強共振』分析", use_container_width=Tr
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 批次下載優化
     batch_size = 40 
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i : i + batch_size]
@@ -119,7 +111,6 @@ if st.button("🔵 開始執行『三強共振』分析", use_container_width=Tr
             for sym in batch:
                 try:
                     df = data[sym].dropna() if len(batch) > 1 else data.dropna()
-                    if len(df) < 30: continue
                     res = analyze_sop_v5(df, ret_target)
                     if res:
                         res["股票"] = f"{sym.split('.')[0]} {all_stocks[sym]}"
@@ -132,7 +123,7 @@ if st.button("🔵 開始執行『三強共振』分析", use_container_width=Tr
     progress_bar.empty()
 
     if results:
-        st.success(f"✅ 找到 {len(results)} 檔符合條件標的")
+        st.success(f"✅ 找到 {len(results)} 檔符合標的")
         for item in results:
             with st.container(border=True):
                 st.write(f"### {item['股票']}")
