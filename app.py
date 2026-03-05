@@ -4,7 +4,6 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 import urllib3
-import io
 from datetime import datetime
 
 # 隱藏 SSL 警告
@@ -23,42 +22,47 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取全台股清單 (精確讀取您的 CSV) ---
-@st.cache_data(ttl=3600)
+# --- 2. 獲取全台股清單 (手動逐行解析 CSV，最穩定) ---
+@st.cache_data(ttl=600) # 10分鐘更新一次
 def get_full_taiwan_list():
     stocks = {}
     try:
-        # 直接讀取您的 GitHub CSV 原始內容
+        # 直接抓取 GitHub CSV 原始文字內容
         csv_url = "https://raw.githubusercontent.com"
         resp = requests.get(f"{csv_url}?v={datetime.now().timestamp()}", timeout=10)
         
         if resp.status_code == 200:
-            # 使用 utf-8-sig 處理可能存在的 BOM，並強制轉為字串
-            df_csv = pd.read_csv(io.StringIO(resp.text), encoding='utf-8-sig').dropna()
-            
-            for _, row in df_csv.iterrows():
-                # 取得第一欄(代號)與第二欄(名稱)，並徹底移除空格
-                s_code = str(row.iloc[0]).strip().upper()
-                s_name = str(row.iloc[1]).strip()
-                
-                # 只有長度大於 4 (例如 1101.TW) 才加入，避免空值
-                if len(s_code) >= 4:
-                    stocks[s_code] = s_name
+            # 將內容拆成一行一行來讀取，避開 pandas 的解析錯誤
+            lines = resp.text.strip().splitlines()
+            for line in lines:
+                # 嘗試用半形逗號分割
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    code = parts[0].strip().upper()
+                    name = parts[1].strip()
+                    # 過濾掉標題行和無效行
+                    if "代號" not in code and len(code) >= 4:
+                        # 自動修正：如果沒帶後綴，補上 .TW
+                        if not (code.endswith('.TW') or code.endswith('.TWO')):
+                            code = f"{code}.TW"
+                        stocks[code] = name
             
             if len(stocks) > 0:
                 return stocks, "📡 已成功載入您的 CSV 股票清單"
     except Exception as e:
         st.sidebar.error(f"讀取錯誤: {str(e)}")
     
-    # 若 CSV 失敗的保底
+    # 最終保底
     return {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科"}, "⚠️ 使用內建保底清單"
 
 # --- 3. 核心 SOP 分析 ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
     try:
         if df is None or len(df) < 35: return None
-        # 轉為純數據
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+        # 確保數據清理
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce').dropna()
+        if len(df) < 30: return None
+        
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['VMA20'] = ta.sma(df['Volume'], length=20)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -99,25 +103,21 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     all_stocks, status_msg = get_full_taiwan_list()
     st.info(status_msg)
     
-    # 準備下載代號清單 (排除重複並排序)
     tickers = sorted(list(all_stocks.keys()))[:int(scan_limit)]
     
     if not tickers:
-        st.error("清單為空，請檢查 CSV 檔案。")
+        st.error("清單為空，請檢查 CSV 內容。")
     else:
         results = []
         progress_bar = st.progress(0)
-        with st.spinner('同步數據中...'):
-            # 修正：yf.download 必須接收 list
+        with st.spinner('同步市場數據中...'):
             data = yf.download(tickers, period="6mo", group_by='ticker', auto_adjust=True, progress=False)
 
         for idx, sym in enumerate(tickers):
             progress_bar.progress((idx + 1) / len(tickers))
             try:
-                # 抓取單檔資料
                 df = data[sym].dropna() if len(tickers) > 1 else data.dropna()
                 if len(df) < 20: continue
-                
                 res = analyze_sop_v4(df, vol_target, kd_limit)
                 if res:
                     res["股票"] = f"{sym.split('.')[0]} {all_stocks[sym]}"
