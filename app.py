@@ -4,7 +4,11 @@ import pandas as pd
 import pandas_ta as ta
 import time
 import requests
+import urllib3
 from datetime import datetime
+
+# 隱藏 SSL 警告訊息
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 1. 頁面設定：手機大字體與居中佈局 ---
 st.set_page_config(page_title="2026 全台股 SOP 掃描", layout="centered")
@@ -35,25 +39,46 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取全台股清單 (加入斷線偵測) ---
+# --- 2. 獲取全台股清單 (多重備援模式) ---
 @st.cache_data(ttl=86400)
 def get_full_taiwan_list():
     stocks = {}
-    try:
-        # 嘗試從證交所 OpenAPI 獲取清單
-        response = requests.get('https://openapi.twse.com.tw', timeout=10)
-        if response.status_code == 200:
-            res = response.json()
-            for s in res:
-                stocks[f"{s['Code']}.TW"] = s['Name']
-            # 加入常用上櫃標的
-            tpex = {"8069.TWO": "元太", "6488.TWO": "環球晶", "5274.TWO": "信驊", "3293.TWO": "鈊象", "6138.TWO": "茂達"}
-            stocks.update(tpex)
-        else:
-            return None # 回傳 None 代表連線失敗
-    except:
-        return None # 發生任何錯誤皆視為連線失敗
-    return stocks
+    # 備援 API 清單
+    api_urls = [
+        'https://openapi.twse.com.tw',
+        'https://openapi.twse.com.tw'
+    ]
+    
+    success = False
+    for url in api_urls:
+        try:
+            response = requests.get(url, timeout=8, verify=False)
+            if response.status_code == 200:
+                res = response.json()
+                for s in res:
+                    code = s.get('Code') or s.get('SecId')
+                    name = s.get('Name') or s.get('SecName')
+                    if code and len(code) == 4:
+                        stocks[f"{code}.TW"] = name
+                success = True
+                break
+        except:
+            continue
+
+    if success:
+        # 加入常用上櫃標的
+        tpex = {"8069.TWO": "元太", "6488.TWO": "環球晶", "5274.TWO": "信驊", "3293.TWO": "鈊象", "6138.TWO": "茂達"}
+        stocks.update(tpex)
+        return stocks, "Online"
+    else:
+        # 如果全部失敗，回傳離線權值股清單 (50檔)
+        offline_list = {
+            "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達", 
+            "2308.TW": "台達電", "2881.TW": "富邦金", "2882.TW": "國泰金", "2303.TW": "聯電",
+            "2891.TW": "中信金", "3008.TW": "大立光", "2603.TW": "長榮", "1301.TW": "台塑",
+            "2002.TW": "中鋼", "2412.TW": "中華電", "2886.TW": "兆豐金", "5880.TW": "合庫金"
+        }
+        return offline_list, "Offline"
 
 # --- 3. 核心 SOP 分析引擎 ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
@@ -68,7 +93,7 @@ def analyze_sop_v4(df, vol_mult, kd_threshold):
 
     curr, prev = df.iloc[-1], df.iloc[-2]
 
-    # 篩選邏輯
+    # 篩選邏輯：月線支撐 + (帶量或KD金叉)
     is_trend_ok = curr['Close'] > (curr['MA20'] * 0.98)
     if not is_trend_ok: return None
 
@@ -93,14 +118,6 @@ def analyze_sop_v4(df, vol_mult, kd_threshold):
 st.title("⚡ 2026 全台股 SOP 掃描")
 st.caption(f"📅 掃描時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-st.markdown("""
-<div class="guide-box">
-<b>⚙️ 參數調整秘訣：</b><br>
-1. <b>量能標準：</b> 若標的太少，請調低至 <b>0.7</b>。<br>
-2. <b>KD 門檻：</b> 設 <b>30</b> 找超跌；設 <b>60</b> 找強勢。
-</div>
-""", unsafe_allow_html=True)
-
 with st.sidebar:
     st.header("⚙️ 掃描參數")
     vol_target = st.slider("1. 量能倍數門檻", 0.5, 3.0, 1.0, 0.1)
@@ -112,56 +129,54 @@ with st.sidebar:
 
 # --- 5. 執行邏輯 ---
 if st.button("🔵 開始分析符合標的", use_container_width=True):
-    all_stocks = get_full_taiwan_list()
+    all_stocks, mode = get_full_taiwan_list()
     
-    if all_stocks is None:
-        st.error("❌ 網路連線失敗：無法取得證交所股票清單")
-        st.info("💡 請確認您的網路連線，或檢查證交所 API 是否正常運作。")
+    if mode == "Offline":
+        st.warning("⚠️ 目前連線證交所失敗，改為分析內建核心權值股清單。")
+    
+    scan_items = list(all_stocks.items())[:scan_limit]
+    tickers = [item[0] for item in scan_items]
+    
+    results = []
+    progress_bar = st.progress(0)
+
+    with st.spinner('市場數據同步中...'):
+        data = yf.download(tickers, period="4mo", group_by='ticker', threads=True, progress=False)
+
+    for idx, (sym, name) in enumerate(scan_items):
+        progress_bar.progress((idx + 1) / len(scan_items))
+        try:
+            df = data[sym].dropna() if len(tickers) > 1 else data.dropna()
+            if df.empty: continue
+            res = analyze_sop_v4(df, vol_target, kd_limit)
+            if res:
+                res["股票"] = f"{sym.split('.')[0]} {name}"
+                results.append(res)
+        except:
+            continue
+
+    progress_bar.empty()
+
+    if results:
+        sorted_res = sorted(results, key=lambda x: x['優劣'])
+        st.success(f"✅ 掃描完成！符合條件：{len(results)} 檔")
+        for item in sorted_res:
+            with st.container(border=True):
+                st.write(f"### {item['股票']}")
+                st.info(f"訊號：{item['訊號']}")
+                c1, c2 = st.columns(2)
+                c1.metric("目前價格", f"{item['現價']}")
+                c2.write(f"📊 量比：`{item['量比']}x` \n\n📈 K值：`{item['K值']}`")
+                st.markdown(f"""
+                <div class="price-box">
+                🟢 建議買進：<span style="color:#00FF88;">{item['建議買進']}</span><br>
+                🔴 波段賣出：<span style="color:#FF4B4B;">{item['波段賣出']}</span><br>
+                🔵 關鍵支撐：<span style="color:#4FACFE;">{item['關鍵支撐']}</span>
+                </div>
+                """, unsafe_allow_html=True)
     else:
-        scan_items = list(all_stocks.items())[:scan_limit]
-        tickers = [item[0] for item in scan_items]
-        
-        results = []
-        progress_bar = st.progress(0)
-
-        with st.spinner('獲取市場數據中...'):
-            data = yf.download(tickers, period="4mo", group_by='ticker', threads=True, progress=False)
-
-        for idx, (sym, name) in enumerate(scan_items):
-            progress_bar.progress((idx + 1) / len(scan_items))
-            try:
-                # 處理單檔與多檔數據結構差異
-                df = data[sym].dropna() if len(tickers) > 1 else data.dropna()
-                if df.empty: continue
-                res = analyze_sop_v4(df, vol_target, kd_limit)
-                if res:
-                    res["股票"] = f"{sym.split('.')[0]} {name}"
-                    results.append(res)
-            except:
-                continue
-
-        progress_bar.empty()
-
-        if results:
-            sorted_res = sorted(results, key=lambda x: x['優劣'])
-            st.success(f"✅ 掃描完成！符合條件：{len(results)} 檔")
-            for item in sorted_res:
-                with st.container(border=True):
-                    st.write(f"### {item['股票']}")
-                    st.info(f"訊號：{item['訊號']}")
-                    c1, c2 = st.columns(2)
-                    c1.metric("目前價格", f"{item['現價']}")
-                    c2.write(f"📊 量比：`{item['量比']}x` \n\n📈 K值：`{item['K值']}`")
-                    st.markdown(f"""
-                    <div class="price-box">
-                    🟢 建議買進：<span style="color:#00FF88;">{item['建議買進']}</span><br>
-                    🔴 波段賣出：<span style="color:#FF4B4B;">{item['波段賣出']}</span><br>
-                    🔵 關鍵支撐：<span style="color:#4FACFE;">{item['關鍵支撐']}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-        else:
-            st.error("❌ 今日查無符合標的")
-            st.info("💡 建議操作：請嘗試調低量能門檻或增加掃描檔數。")
+        st.error("❌ 今日查無符合標的")
+        st.info("💡 建議操作：請嘗試調低量能門檻(0.7)或增加掃描數量。")
 
 st.divider()
 st.caption("⚠ 免責聲明：本工具僅供 2026 技術分析參考。投資盈虧請自行負責。")
