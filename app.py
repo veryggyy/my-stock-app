@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import time
 import requests
 import urllib3
 from datetime import datetime
@@ -24,59 +23,51 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取全台股清單 (修正格式防呆) ---
+# --- 2. 獲取全台股清單 (包含 CSV 備援機制) ---
 @st.cache_data(ttl=86400)
 def get_full_taiwan_list():
     stocks = {}
-    api_urls = [
-        'https://openapi.twse.com.tw',
-        'https://openapi.twse.com.tw'
-    ]
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    success = False
-    for url in api_urls:
-        try:
-            response = requests.get(url, timeout=10, verify=False, headers=headers)
-            if response.status_code == 200:
-                res = response.json()
-                for s in res:
-                    code = str(s.get('Code') or s.get('SecId') or '')
-                    name = s.get('Name') or s.get('SecName') or ''
-                    if len(code) == 4:
-                        stocks[f"{code}.TW"] = name
-                if len(stocks) > 50:
-                    success = True
-                    break
-        except:
-            continue
+    # 策略 A: 嘗試政府 API
+    try:
+        url = 'https://openapi.twse.com.tw'
+        response = requests.get(url, timeout=5, verify=False, headers=headers)
+        if response.status_code == 200:
+            for s in response.json():
+                if len(str(s['Code'])) == 4:
+                    stocks[f"{s['Code']}.TW"] = s['Name']
+            if len(stocks) > 100: return stocks, "API 連線正常"
+    except: pass
 
-    if success:
-        # 加入必備上櫃標的
-        tpex = {"8069.TWO": "元太", "6488.TWO": "環球晶", "5274.TWO": "信驊", "3293.TWO": "鈊象", "6138.TWO": "茂達"}
-        stocks.update(tpex)
-        return stocks, "Online"
-    else:
-        # 內建離線權值股 (確保格式為清單)
-        offline = {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達", "2603.TW": "長榮", "2308.TW": "台達電"}
-        return offline, "Offline"
+    # 策略 B: 嘗試讀取您 GitHub 上的 CSV 檔案
+    # 注意：請確保您的 CSV 內包含 '代號' (如 2330.TW) 與 '名稱' 欄位
+    try:
+        csv_url = "https://raw.githubusercontent.com"
+        df_csv = pd.read_csv(csv_url)
+        # 假設 CSV 格式為：代號,名稱 (例如 2330.TW,台積電)
+        for _, row in df_csv.iterrows():
+            stocks[str(row['代號'])] = str(row['名稱'])
+        if len(stocks) > 100: return stocks, "已啟用 CSV 備援清單"
+    except: pass
+
+    # 策略 C: 最終保底 (權值股)
+    offline = {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達"}
+    return offline, "API/CSV 讀取失敗，使用權值股"
 
 # --- 3. 核心 SOP 分析引擎 ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
     try:
         if df is None or len(df) < 35: return None
-        # 計算指標
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['VMA20'] = ta.sma(df['Volume'], length=20)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         kd = ta.stoch(df['High'], df['Low'], df['Close'])
         df['K'], df['D'] = kd['STOCHk_14_3_3'], kd['STOCHd_14_3_3']
-        
         curr, prev = df.iloc[-1], df.iloc[-2]
         
-        # 邏輯過濾
+        # 過濾：股價需在月線附近或上方
         if curr['Close'] < (curr['MA20'] * 0.97): return None
-        
         is_vol = (curr['Volume'] > curr['VMA20'] * vol_mult)
         is_kd = (prev['K'] < kd_threshold) and (curr['K'] > curr['D'])
 
@@ -90,7 +81,6 @@ def analyze_sop_v4(df, vol_mult, kd_threshold):
                 "關鍵支撐": round(float(min(curr['MA20'], curr['Low'])), 2)
             }
     except: return None
-    return None
 
 # --- 4. 主介面 ---
 st.title("⚡ 2026 全台股 SOP 掃描")
@@ -107,10 +97,9 @@ with st.sidebar:
 
 # --- 5. 執行分析 ---
 if st.button("🔵 開始分析符合標的", use_container_width=True):
-    all_stocks, mode = get_full_taiwan_list()
-    if mode == "Offline": st.warning("⚠️ 證交所 API 連線失敗，目前掃描內建權值股。")
+    all_stocks, status_msg = get_full_taiwan_list()
+    st.info(f"📡 狀態：{status_msg}")
     
-    # 修正：確保 tickers 是純 list 格式
     raw_items = list(all_stocks.items())[:int(scan_limit)]
     tickers = [item[0] for item in raw_items]
     
@@ -118,20 +107,17 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     progress_bar = st.progress(0)
 
     with st.spinner('同步市場數據中...'):
-        # 修正：yf.download 的正確調用方式
         data = yf.download(tickers, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
 
     for idx, (sym, name) in enumerate(raw_items):
         progress_bar.progress((idx + 1) / len(raw_items))
         try:
-            # 處理單檔與多檔數據提取
             df = data[sym] if len(tickers) > 1 else data
             df = df.dropna()
             if len(df) < 20: continue
-            
             res = analyze_sop_v4(df, vol_target, kd_limit)
             if res:
-                res["股票"] = f"{sym.replace('.TW','').replace('.TWO','')} {name}"
+                res["股票"] = f"{sym.split('.')[0]} {name}"
                 results.append(res)
         except: continue
     
