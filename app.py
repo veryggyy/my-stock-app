@@ -9,20 +9,24 @@ from datetime import datetime
 # 隱藏 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- 1. 頁面設定 ---
-st.set_page_config(page_title="2026 全台股 SOP 掃描器", layout="centered")
+# --- 1. 頁面設定：手機優化佈局 ---
+st.set_page_config(page_title="2026 三強共振 SOP 掃描", layout="centered")
 
 st.markdown("""
     <style>
     .block-container { padding-top: 1rem; max-width: 500px; }
     h3 { font-size: 1.8rem !important; font-weight: 800; color: #FFD700; margin-bottom: 5px; }
     [data-testid="stMetricValue"] { font-size: 2.2rem !important; color: #00FFCC !important; font-weight: 900; }
-    .price-box { font-size: 1.2rem; line-height: 2; font-weight: bold; padding: 12px; background: #0f172a; border-radius: 10px; border: 1px solid #374151; }
+    .price-box { 
+        font-size: 1.2rem; line-height: 2; font-weight: bold; padding: 15px; 
+        background: #0f172a; border-radius: 12px; border: 1px solid #3b82f6; 
+    }
+    .stProgress > div > div > div > div { background-color: #00ffcc; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取清單 ---
-@st.cache_data(ttl=300)
+# --- 2. 獲取全台股清單 (CSV 讀取邏輯) ---
+@st.cache_data(ttl=600)
 def get_full_taiwan_list():
     stocks = {}
     try:
@@ -39,70 +43,70 @@ def get_full_taiwan_list():
                         if not (code.endswith('.TW') or code.endswith('.TWO')):
                             code = f"{code}.TW"
                         stocks[code] = name
-            if len(stocks) > 0: return stocks, "已成功載入您的 CSV 股票清單"
+            if len(stocks) > 0: return stocks, f"📡 已成功載入 {len(stocks)} 檔股票清單"
     except: pass
-    return {"2330.TW": "台積電", "2317.TW": "鴻海"}, "⚠️ 使用內建保底清單"
+    return {"2330.TW": "台積電", "2317.TW": "鴻海"}, "⚠️ CSV 讀取失敗，使用保底清單"
 
-# --- 3. 核心 SOP 分析引擎 (強化結構解析) ---
-def analyze_sop_v4(df, vol_mult, kd_threshold):
+# --- 3. 核心 SOP 分析引擎 (三強共振版) ---
+def analyze_sop_v5(df, up_threshold):
     try:
-        if df is None or len(df) < 30: return None
+        if df is None or len(df) < 40: return None
         
-        # 1. 統一欄位名稱並轉為浮點數
+        # 數據清洗
         df.columns = [str(c).capitalize() for c in df.columns]
-        cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        df = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce').dropna()
         
-        # 2. 指標計算
+        # 1. 趨勢指標：20MA 與 20MA 斜率
         df['MA20'] = ta.sma(df['Close'], length=20)
-        df['VMA20'] = ta.sma(df['Volume'], length=20)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        df['MA20_Slope'] = df['MA20'].diff(3) # 近三日斜率
         
-        # 3. KD 計算 (處理 pandas_ta 可能的隨機欄位名)
+        # 2. 動能指標：KD 金叉 (14, 3, 3)
         kd_df = ta.stoch(df['High'], df['Low'], df['Close'], k=14, d=3, smooth_k=3)
-        k_val = kd_df.iloc[-1, 0] # 取最後一列的第一欄 (K)
-        d_val = kd_df.iloc[-1, 1] # 取最後一列的第二欄 (D)
-        prev_k = kd_df.iloc[-2, 0] # 前一天的 K
+        df['K'], df['D'] = kd_df.iloc[:, 0], kd_df.iloc[:, 1]
         
-        curr_p = df['Close'].iloc[-1]
-        curr_v = df['Volume'].iloc[-1]
-        vma = df['VMA20'].iloc[-1]
-        ma20 = df['MA20'].iloc[-1]
+        # 3. 表態指標：5日均量
+        df['VMA5'] = ta.sma(df['Volume'], length=5)
         
-        # 4. 篩選邏輯 (寬鬆版)
-        is_vol = (curr_v > vma * vol_mult)
-        is_kd = (prev_k < kd_threshold) and (k_val > d_val)
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # --- 判定邏輯 ---
+        # A. 趨勢：價 > 20MA 且 20MA 斜率向上
+        is_trend = (curr['Close'] > curr['MA20']) and (curr['MA20_Slope'] > 0)
+        
+        # B. 動能：KD 金叉 (今日 K > D 且 昨日 K <= D)
+        is_kd_cross = (curr['K'] > curr['D']) and (prev['K'] <= prev['D'])
+        
+        # C. 表態：量 > 5日均量 且 今日漲幅 > 設定門檻
+        ret = (curr['Close'] / prev['Close'] - 1) * 100
+        is_breakout = (curr['Volume'] > curr['VMA5']) and (ret >= up_threshold)
 
-        if is_vol or is_kd:
-            rank = 1 if (is_vol and is_kd) else (2 if is_vol else 3)
+        if is_trend and is_kd_cross and is_breakout:
             return {
-                "優劣": rank,
-                "訊號": "🔥 帶量金叉" if rank == 1 else ("🚀 攻擊 (帶量)" if rank == 2 else "🎯 轉強 (金叉)"),
-                "現價": round(float(curr_p), 2),
-                "量比": round(float(curr_v / vma), 2),
-                "K值": int(k_val),
-                "建議買進": round(float(ma20), 2),
-                "波段賣出": round(float(curr_p + (df['ATR'].iloc[-1] * 2.1)), 2),
-                "關鍵支撐": round(float(min(ma20, df['Low'].iloc[-1])), 2)
+                "訊號": "🔥 三強共振 (起漲訊號)",
+                "現價": round(float(curr['Close']), 2),
+                "漲幅": f"{round(ret, 2)}%",
+                "量能比": f"{round(curr['Volume']/curr['VMA5'], 2)}x",
+                "K值": int(curr['K']),
+                "月線位置": round(float(curr['MA20']), 2)
             }
     except: return None
     return None
 
-# --- 4. 主介面 ---
-st.title("⚡ 2026 全台股 SOP 掃描")
+# --- 4. 主介面設計 ---
+st.title("⚡ 2026 三強共振掃描")
 st.caption(f"📅 系統日期: {datetime.now().strftime('%Y-%m-%d')}")
 
 with st.sidebar:
-    st.header("⚙️ 參數設定")
-    vol_target = st.slider("1. 量能倍數", 0.1, 2.0, 0.5, 0.1)
-    kd_limit = st.slider("2. KD 門檻", 10, 90, 80, 5)
-    scan_limit = st.number_input("3. 掃描檔數", 10, 2800, 300)
+    st.header("⚙️ 篩選門檻")
+    ret_target = st.slider("今日漲幅門檻 (%)", 1.0, 7.0, 3.0, 0.5)
+    scan_limit = st.number_input("掃描數量 (建議 1000 以上)", 10, 2800, 500)
     if st.button("🔄 清除快取並重啟"):
         st.cache_data.clear()
         st.rerun()
 
 # --- 5. 執行分析 ---
-if st.button("🔵 開始分析符合標的", use_container_width=True):
+if st.button("🔵 開始執行『三強共振』分析", use_container_width=True):
     all_stocks, status_msg = get_full_taiwan_list()
     st.info(status_msg)
     
@@ -111,26 +115,19 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 分批下載：每次抓 20 檔，避免 MultiIndex 結構過於混亂
-    batch_size = 20 
+    # 批次下載：每次 30 檔
+    batch_size = 30 
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i : i + batch_size]
-        status_text.text(f"正在分析 {i+1} ~ {min(i+batch_size, len(tickers))} 檔...")
+        status_text.text(f"正在分析 {i+1} ~ {min(i+batch_size, len(tickers))} 檔股票...")
         try:
-            # 獲取數據
             data = yf.download(batch, period="4mo", group_by='ticker', auto_adjust=True, progress=False)
-            
             for sym in batch:
                 try:
-                    # 強制提取對應股票的數據
-                    if len(batch) > 1:
-                        df_target = data[sym].copy().dropna()
-                    else:
-                        df_target = data.copy().dropna()
-                        
-                    if len(df_target) < 25: continue
+                    df_target = data[sym].dropna() if len(batch) > 1 else data.dropna()
+                    if len(df_target) < 30: continue
                     
-                    res = analyze_sop_v4(df_target, vol_target, kd_limit)
+                    res = analyze_sop_v5(df_target, ret_target)
                     if res:
                         res["股票"] = f"{sym.split('.')[0]} {all_stocks[sym]}"
                         results.append(res)
@@ -142,17 +139,23 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     progress_bar.empty()
 
     if results:
-        st.success(f"✅ 找到 {len(results)} 檔符合標的")
-        for item in sorted(results, key=lambda x: x['優劣']):
+        st.success(f"✅ 找到 {len(results)} 檔符合『強勢起漲』標的")
+        for item in results:
             with st.container(border=True):
                 st.write(f"### {item['股票']}")
-                st.info(f"訊號：{item['訊號']}")
+                st.write(f"**訊號：{item['訊號']}**")
                 c1, c2 = st.columns(2)
-                c1.metric("目前價格", f"{item['現價']}")
-                c2.write(f"📊 量比：`{item['量比']}x` \n\n📈 K值：`{item['K值']}`")
-                st.markdown(f'<div class="price-box">🟢 建議買進：{item["建議買進"]}<br>🔴 波段賣出：{item["波段賣出"]}<br>🔵 關鍵支撐：{item["關鍵支撐"]}</div>', unsafe_allow_html=True)
+                c1.metric("目前價格", f"{item['現價']}", f"{item['漲幅']}")
+                c2.write(f"📊 量能比：`{item['量能比']}` \n\n📈 K值：`{item['K值']}`")
+                st.markdown(f"""
+                <div class="price-box">
+                🟢 月線支撐：<span style="color:#00FF88;">{item['月線位置']}</span><br>
+                🔵 趨勢方向：<span style="color:#4FACFE;">20MA 斜率向上 ↗</span>
+                </div>
+                """, unsafe_allow_html=True)
     else:
-        st.error("❌ 目前條件下無符合標的。")
+        st.error("❌ 目前市場中查無符合標的。")
+        st.info("💡 建議：調低『今日漲幅門檻』至 1.5% 或增加『掃描數量』。")
 
 st.divider()
-st.caption("⚠ 免責聲明：僅供參考，投資盈虧自負。")
+st.caption("⚠ 僅供參考。KD 金叉與帶量漲幅為強勢股常見特徵，投資應注意風險。")
