@@ -23,55 +23,61 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取全台股清單 (超強韌性版) ---
-@st.cache_data(ttl=86400)
+# --- 2. 獲取全台股清單 (強化 CSV 讀取邏輯) ---
+@st.cache_data(ttl=3600) # 縮短快取時間，方便偵測新檔案
 def get_full_taiwan_list():
     stocks = {}
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    # 策略 A: 嘗試讀取您 GitHub 上的 CSV 檔案 (最推薦)
+    # 策略 A: 優先嘗試讀取您的 GitHub CSV 檔案
     try:
-        # 注意：這裡會自動嘗試讀取您的儲存庫檔案
+        # 使用 raw 連結，確保抓到的是純文字內容
         csv_url = "https://raw.githubusercontent.com"
-        df_csv = pd.read_csv(csv_url, encoding='utf-8-sig')
-        # 自動識別欄位名稱 (相容 '代號' 或 'code')
-        c_col = [c for c in df_csv.columns if '代' in c or 'code' in c.lower()][0]
-        n_col = [c for c in df_csv.columns if '名' in c or 'name' in c.lower()][0]
-        for _, row in df_csv.iterrows():
-            code = str(row[c_col]).strip()
-            if '.TW' not in code and '.TWO' not in code: code += '.TW'
-            stocks[code] = str(row[n_col]).strip()
-        if len(stocks) > 10: return stocks, "已成功載入您的 CSV 清單"
-    except: pass
+        # 加上隨機參數避免 GitHub 快取舊檔案
+        response = requests.get(f"{csv_url}?v={datetime.now().timestamp()}", timeout=5)
+        
+        if response.status_code == 200:
+            import io
+            # 確保支援中文編碼 utf-8-sig
+            df_csv = pd.read_csv(io.StringIO(response.text))
+            
+            # 自動偵測「代號」與「名稱」這兩個欄位的位置
+            code_col = df_csv.columns[0]
+            name_col = df_csv.columns[1]
+            
+            for _, row in df_csv.iterrows():
+                code = str(row[code_col]).strip()
+                name = str(row[name_col]).strip()
+                # 判斷是否需要補上市場後綴
+                if not (code.endswith('.TW') or code.endswith('.TWO')):
+                    code = f"{code}.TW"
+                stocks[code] = name
+            
+            if len(stocks) > 5:
+                return stocks, "📡 已成功載入您的 CSV 股票清單"
+    except Exception as e:
+        pass
 
-    # 策略 B: 嘗試政府 OpenAPI
+    # 策略 B: 嘗試政府 OpenAPI (當作備援)
     try:
         url = 'https://openapi.twse.com.tw'
-        response = requests.get(url, timeout=5, verify=False, headers=headers)
-        if response.status_code == 200:
-            for s in response.json():
-                if len(str(s['Code'])) == 4:
-                    stocks[f"{s['Code']}.TW"] = s['Name']
-            if len(stocks) > 100: return stocks, "API 連線正常 (即時清單)"
+        res = requests.get(url, timeout=5, verify=False, headers=headers).json()
+        for s in res:
+            if len(str(s['Code'])) == 4:
+                stocks[f"{s['Code']}.TW"] = s['Name']
+        if len(stocks) > 100: return stocks, "🌐 API 連線正常 (即時清單)"
     except: pass
 
-    # 策略 C: 最終保底 (核心 15 檔)
-    offline = {
-        "2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達",
-        "2603.TW": "長榮", "2308.TW": "台達電", "2881.TW": "富邦金", "2882.TW": "國泰金",
-        "2303.TW": "聯電", "2891.TW": "中信金", "3008.TW": "大立光", "2002.TW": "中鋼",
-        "2412.TW": "中華電", "2609.TW": "陽明", "2615.TW": "萬海"
-    }
-    return offline, "API/CSV 讀取失敗，使用核心權值股"
+    # 策略 C: 最終保底 (核心權值股)
+    offline = {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達"}
+    return offline, "⚠️ CSV 與 API 均失敗，使用核心權值股"
 
 # --- 3. 核心 SOP 分析引擎 ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
     try:
         if df is None or len(df) < 35: return None
-        # 確保資料為浮點數
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             df[col] = df[col].astype(float)
-            
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['VMA20'] = ta.sma(df['Volume'], length=20)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -110,17 +116,15 @@ with st.sidebar:
 # --- 5. 執行分析 ---
 if st.button("🔵 開始分析符合標的", use_container_width=True):
     all_stocks, status_msg = get_full_taiwan_list()
-    st.info(f"📡 狀態：{status_msg}")
+    st.info(status_msg)
     
-    # 轉換清單
     raw_items = list(all_stocks.items())[:int(scan_limit)]
-    tickers = [item[0] for item in raw_items]
+    tickers = [item for item in raw_items]
     
     results = []
     progress_bar = st.progress(0)
 
     with st.spinner('同步市場數據中...'):
-        # 批次下載
         data = yf.download(tickers, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
 
     for idx, (sym, name) in enumerate(raw_items):
@@ -149,4 +153,4 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
         st.error("❌ 目前條件下無符合標的。")
 
 st.divider()
-st.caption("⚠ 免責聲明：僅供參考，投資請自行評估風險。")
+st.caption("⚠ 免責聲明：僅供參考，投資盈虧自負。")
