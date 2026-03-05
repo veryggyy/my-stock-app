@@ -4,6 +4,7 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 import urllib3
+import io
 from datetime import datetime
 
 # 隱藏 SSL 警告
@@ -19,65 +20,45 @@ st.markdown("""
     [data-testid="stMetricValue"] { font-size: 3rem !important; color: #00FFCC !important; font-weight: 900; }
     .guide-box { background-color: #1e293b; padding: 15px; border-radius: 12px; border-left: 6px solid #3b82f6; margin-bottom: 20px; font-size: 1.1rem; }
     .price-box { font-size: 1.5rem; line-height: 2.2; font-weight: bold; padding: 12px; background: #0f172a; border-radius: 10px; border: 1px solid #374151; }
-    .stProgress > div > div > div > div { background-color: #00ffcc; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取全台股清單 (強化 CSV 讀取邏輯) ---
-@st.cache_data(ttl=3600) # 縮短快取時間，方便偵測新檔案
+# --- 2. 獲取全台股清單 (精確讀取您的 CSV) ---
+@st.cache_data(ttl=3600)
 def get_full_taiwan_list():
     stocks = {}
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
-    # 策略 A: 優先嘗試讀取您的 GitHub CSV 檔案
     try:
-        # 使用 raw 連結，確保抓到的是純文字內容
+        # 直接讀取您的 GitHub CSV 原始內容
         csv_url = "https://raw.githubusercontent.com"
-        # 加上隨機參數避免 GitHub 快取舊檔案
-        response = requests.get(f"{csv_url}?v={datetime.now().timestamp()}", timeout=5)
+        resp = requests.get(f"{csv_url}?v={datetime.now().timestamp()}", timeout=10)
         
-        if response.status_code == 200:
-            import io
-            # 確保支援中文編碼 utf-8-sig
-            df_csv = pd.read_csv(io.StringIO(response.text))
-            
-            # 自動偵測「代號」與「名稱」這兩個欄位的位置
-            code_col = df_csv.columns[0]
-            name_col = df_csv.columns[1]
+        if resp.status_code == 200:
+            # 使用 utf-8-sig 處理可能存在的 BOM，並強制轉為字串
+            df_csv = pd.read_csv(io.StringIO(resp.text), encoding='utf-8-sig').dropna()
             
             for _, row in df_csv.iterrows():
-                code = str(row[code_col]).strip()
-                name = str(row[name_col]).strip()
-                # 判斷是否需要補上市場後綴
-                if not (code.endswith('.TW') or code.endswith('.TWO')):
-                    code = f"{code}.TW"
-                stocks[code] = name
+                # 取得第一欄(代號)與第二欄(名稱)，並徹底移除空格
+                s_code = str(row.iloc[0]).strip().upper()
+                s_name = str(row.iloc[1]).strip()
+                
+                # 只有長度大於 4 (例如 1101.TW) 才加入，避免空值
+                if len(s_code) >= 4:
+                    stocks[s_code] = s_name
             
-            if len(stocks) > 5:
+            if len(stocks) > 0:
                 return stocks, "📡 已成功載入您的 CSV 股票清單"
     except Exception as e:
-        pass
+        st.sidebar.error(f"讀取錯誤: {str(e)}")
+    
+    # 若 CSV 失敗的保底
+    return {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科"}, "⚠️ 使用內建保底清單"
 
-    # 策略 B: 嘗試政府 OpenAPI (當作備援)
-    try:
-        url = 'https://openapi.twse.com.tw'
-        res = requests.get(url, timeout=5, verify=False, headers=headers).json()
-        for s in res:
-            if len(str(s['Code'])) == 4:
-                stocks[f"{s['Code']}.TW"] = s['Name']
-        if len(stocks) > 100: return stocks, "🌐 API 連線正常 (即時清單)"
-    except: pass
-
-    # 策略 C: 最終保底 (核心權值股)
-    offline = {"2330.TW": "台積電", "2317.TW": "鴻海", "2454.TW": "聯發科", "2382.TW": "廣達"}
-    return offline, "⚠️ CSV 與 API 均失敗，使用核心權值股"
-
-# --- 3. 核心 SOP 分析引擎 ---
+# --- 3. 核心 SOP 分析 ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
     try:
         if df is None or len(df) < 35: return None
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            df[col] = df[col].astype(float)
+        # 轉為純數據
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['VMA20'] = ta.sma(df['Volume'], length=20)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -118,39 +99,42 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     all_stocks, status_msg = get_full_taiwan_list()
     st.info(status_msg)
     
-    raw_items = list(all_stocks.items())[:int(scan_limit)]
-    tickers = [item for item in raw_items]
+    # 準備下載代號清單 (排除重複並排序)
+    tickers = sorted(list(all_stocks.keys()))[:int(scan_limit)]
     
-    results = []
-    progress_bar = st.progress(0)
-
-    with st.spinner('同步市場數據中...'):
-        data = yf.download(tickers, period="6mo", interval="1d", group_by='ticker', auto_adjust=True, progress=False)
-
-    for idx, (sym, name) in enumerate(raw_items):
-        progress_bar.progress((idx + 1) / len(raw_items))
-        try:
-            df = data[sym].dropna() if len(tickers) > 1 else data.dropna()
-            if len(df) < 20: continue
-            res = analyze_sop_v4(df, vol_target, kd_limit)
-            if res:
-                res["股票"] = f"{sym.replace('.TW','').replace('.TWO','')} {name}"
-                results.append(res)
-        except: continue
-    
-    progress_bar.empty()
-
-    if results:
-        for item in sorted(results, key=lambda x: x['優劣']):
-            with st.container(border=True):
-                st.write(f"### {item['股票']}")
-                st.info(f"訊號：{item['訊號']}")
-                c1, c2 = st.columns(2)
-                c1.metric("目前價格", f"{item['現價']}")
-                c2.write(f"📊 量比：`{item['量比']}x` \n\n📈 K值：`{item['K值']}`")
-                st.markdown(f'<div class="price-box">🟢 建議買進：<span style="color:#00FF88;">{item["建議買進"]}</span><br>🔴 波段賣出：<span style="color:#FF4B4B;">{item["波段賣出"]}</span><br>🔵 關鍵支撐：<span style="color:#4FACFE;">{item["關鍵支撐"]}</span></div>', unsafe_allow_html=True)
+    if not tickers:
+        st.error("清單為空，請檢查 CSV 檔案。")
     else:
-        st.error("❌ 目前條件下無符合標的。")
+        results = []
+        progress_bar = st.progress(0)
+        with st.spinner('同步數據中...'):
+            # 修正：yf.download 必須接收 list
+            data = yf.download(tickers, period="6mo", group_by='ticker', auto_adjust=True, progress=False)
+
+        for idx, sym in enumerate(tickers):
+            progress_bar.progress((idx + 1) / len(tickers))
+            try:
+                # 抓取單檔資料
+                df = data[sym].dropna() if len(tickers) > 1 else data.dropna()
+                if len(df) < 20: continue
+                
+                res = analyze_sop_v4(df, vol_target, kd_limit)
+                if res:
+                    res["股票"] = f"{sym.split('.')[0]} {all_stocks[sym]}"
+                    results.append(res)
+            except: continue
+        
+        progress_bar.empty()
+        if results:
+            for item in sorted(results, key=lambda x: x['優劣']):
+                with st.container(border=True):
+                    st.write(f"### {item['股票']}")
+                    st.info(f"訊號：{item['訊號']}")
+                    c1, c2 = st.columns(2)
+                    c1.metric("目前價格", f"{item['現價']}")
+                    c2.write(f"📊 量比：`{item['量比']}x` \n\n📈 K值：`{item['K值']}`")
+                    st.markdown(f'<div class="price-box">🟢 建議買進：<span style="color:#00FF88;">{item["建議買進"]}</span><br>🔴 波段賣出：<span style="color:#FF4B4B;">{item["波段賣出"]}</span><br>🔵 關鍵支撐：<span style="color:#4FACFE;">{item["關鍵支撐"]}</span></div>', unsafe_allow_html=True)
+        else: st.error("❌ 目前條件下無符合標的。")
 
 st.divider()
-st.caption("⚠ 免責聲明：僅供參考，投資盈虧自負。")
+st.caption("⚠ 投資盈虧自負。")
