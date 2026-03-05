@@ -7,4 +7,4 @@ lxml
 numpy
 plotly
 html5lib
-pandas-ta
+pandas_ta
