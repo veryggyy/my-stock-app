@@ -41,18 +41,20 @@ def get_full_taiwan_list():
                         stocks[code] = name
             if len(stocks) > 0: return stocks, "📡 已成功載入您的 CSV 股票清單"
     except: pass
-    return {"2330.TW": "台積電", "2317.TW": "鴻海"}, "⚠️ 使用內建保底"
+    return {"2330.TW": "台積電", "2317.TW": "鴻海"}, "⚠️ 使用內建保底清單"
 
-# --- 3. 核心 SOP 分析 (寬鬆版) ---
+# --- 3. 核心 SOP 分析引擎 (強化數據對齊) ---
 def analyze_sop_v4(df, vol_mult, kd_threshold):
     try:
         if df is None or len(df) < 30: return None
         
-        # 修正欄位名稱 (大小寫相容)
-        df.columns = [c.title() for c in df.columns]
+        # 修正欄位名稱，確保大寫開頭
+        df.columns = [c.capitalize() if isinstance(c, str) else c for c in df.columns]
+        
+        # 提取必要欄位並轉為數字格式
         df = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce').dropna()
         
-        # 指標計算
+        # 計算指標
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['VMA20'] = ta.sma(df['Volume'], length=20)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -65,7 +67,7 @@ def analyze_sop_v4(df, vol_mult, kd_threshold):
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # --- 策略：只要符合帶量 或 只要符合KD金叉就顯示 ---
+        # 寬鬆篩選邏輯
         is_vol = (curr['Volume'] > curr['VMA20'] * vol_mult)
         is_kd = (prev['K'] < kd_threshold) and (curr['K'] > curr['D'])
 
@@ -90,8 +92,8 @@ st.caption(f"📅 當前時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 with st.sidebar:
     st.header("⚙️ 參數設定")
-    vol_target = st.slider("1. 量能倍數", 0.1, 3.0, 0.5, 0.1) # 放寬到 0.1
-    kd_limit = st.slider("2. KD 門檻", 10, 95, 80, 5) # 放寬到 80
+    vol_target = st.slider("1. 量能倍數", 0.1, 3.0, 0.5, 0.1)
+    kd_limit = st.slider("2. KD 門檻", 10, 95, 75, 5)
     scan_limit = st.number_input("3. 掃描檔數", 10, 2800, 500)
     if st.button("🔄 清除快取並重啟"):
         st.cache_data.clear()
@@ -107,18 +109,27 @@ if st.button("🔵 開始分析符合標的", use_container_width=True):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 下載優化 (每次抓 30 檔)
-    batch_size = 30 
+    # 下載優化：改為 20 檔一批，提高穩定性
+    batch_size = 20 
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i : i + batch_size]
         status_text.text(f"正在掃描第 {i+1} 檔以後的股票...")
         try:
-            data = yf.download(batch, period="6mo", group_by='ticker', auto_adjust=True, progress=False)
+            # 獲取數據，確保處理 MultiIndex 問題
+            data = yf.download(batch, period="4mo", group_by='ticker', auto_adjust=True, progress=False)
+            
             for sym in batch:
                 try:
-                    df = data[sym].dropna() if len(batch) > 1 else data.dropna()
-                    if len(df) < 25: continue
-                    res = analyze_sop_v4(df, vol_target, kd_limit)
+                    # 關鍵：精準提取個股 DataFrame
+                    if len(batch) > 1:
+                        if sym not in data.columns.get_level_values(0): continue
+                        df_target = data[sym].copy()
+                    else:
+                        df_target = data.copy()
+                        
+                    if df_target.empty: continue
+                    
+                    res = analyze_sop_v4(df_target, vol_target, kd_limit)
                     if res:
                         res["股票"] = f"{sym.split('.')[0]} {all_stocks[sym]}"
                         results.append(res)
