@@ -4,7 +4,7 @@ import pandas as pd
 import pandas_ta as ta
 import os
 import urllib3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 隱藏 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -25,29 +25,28 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取大盤環境 (^TWII) - 優化抓取邏輯 ---
+# --- 2. 獲取大盤環境 (^TWII) - 強化穩定度 ---
 def get_market_regime():
     try:
-        # 改用 Ticker 模式獲取數據，較不易被封鎖
-        twii_ticker = yf.Ticker("^TWII")
-        twii = twii_ticker.history(period="6mo")
+        # 使用快速歷史數據抓取
+        twii_data = yf.Ticker("^TWII").history(period="6mo")
         
-        if twii.empty or len(twii) < 2:
+        if twii_data.empty or len(twii_data) < 2:
             return "⚠️ 數據源暫時忙碌中", "#FFFFFF", 0.0
             
-        twii['MA20'] = ta.sma(twii['Close'], length=20)
-        curr_price = twii['Close'].iloc[-1]
-        ma20_val = twii['MA20'].iloc[-1]
-        daily_ret = (twii['Close'].iloc[-1] / twii['Close'].iloc[-2] - 1) * 100
+        twii_data['MA20'] = ta.sma(twii_data['Close'], length=20)
+        curr_price = twii_data['Close'].iloc[-1]
+        ma20_val = twii_data['MA20'].iloc[-1]
+        daily_ret = (twii_data['Close'].iloc[-1] / twii_data['Close'].iloc[-2] - 1) * 100
         
         if curr_price > ma20_val:
             return "🟢 大盤位於月線上 (多頭有利)", "#00FFCC", daily_ret
         else:
             return "🔴 大盤位於月線下 (空頭防禦)", "#FF4B4B", daily_ret
-    except Exception as e:
-        return f"⚠️ 抓取異常: {str(e)[:10]}", "#FFFFFF", 0.0
+    except:
+        return "⚠️ 網路限速中，無法顯示大盤", "#FFFFFF", 0.0
 
-# --- 3. 獲取清單 (與原架構一致) ---
+# --- 3. 獲取清單 ---
 @st.cache_data(ttl=600)
 def get_full_taiwan_list():
     stocks = {}
@@ -68,7 +67,7 @@ def get_full_taiwan_list():
         except: pass
     return {"2330.TW": "台積電", "2317.TW": "鴻海"}, {"2330.TW": "半導體", "2317.TW": "電子代工"}, "⚠️ 使用預設清單"
 
-# --- 4. 核心分析引擎 ---
+# --- 4. 核心 SOP 分析引擎 ---
 def analyze_sop_v2026(df, up_threshold):
     try:
         if df is None or len(df) < 65: return None
@@ -110,6 +109,9 @@ def analyze_sop_v2026(df, up_threshold):
     except: return None
 
 # --- 5. 主介面 ---
+# 取得台灣當前時間供標題與檔名使用
+taiwan_now = datetime.utcnow() + timedelta(hours=8)
+
 st.title("⚡ 2026 台股強勢波段雷達")
 market_msg, market_color, market_ret = get_market_regime()
 st.markdown(f"**市場環境：<span style='color:{market_color};'>{market_msg}</span> | 今日大盤漲跌：`{market_ret:.2f}%`**", unsafe_allow_html=True)
@@ -117,8 +119,7 @@ st.markdown(f"**市場環境：<span style='color:{market_color};'>{market_msg}<
 with st.sidebar:
     st.header("⚙️ 篩選參數")
     ret_target = st.slider("突破漲幅門檻 (%)", 0.0, 5.0, 1.5, 0.5)
-    # 修正需求 1：預設值直接設為最大值 3000
-    scan_limit = st.number_input("掃描數量", 10, 3000, 3000)
+    scan_limit = st.number_input("掃描數量", 10, 3000, 3000) # 預設最大 3000
     if st.button("🔄 清除快取"):
         st.cache_data.clear(); st.rerun()
 
@@ -169,16 +170,21 @@ if st.button("🔵 執行全台股深度掃描 (依評分排序)", use_container
         results = sorted(results, key=lambda x: x['評分'], reverse=True)
         st.success(f"✅ 找到 {len(results)} 檔多頭起漲標的")
         
-        # 匯出 CSV (24H 檔名)
-        now_str = datetime.now().strftime("%Y%m%d_%H%M")
+        # --- 修正：強制顯示台灣時間的匯出檔名 ---
+        now_str = taiwan_now.strftime("%Y%m%d_%H%M")
         export_df = pd.DataFrame(results).drop(columns=["符合"])
-        st.download_button("📥 匯出當下分析清單 (CSV)", export_df.to_csv(index=False).encode('utf-8-sig'), f"taiwan_stocks_{now_str}.csv", "text/csv")
+        st.download_button(
+            label="📥 匯出當下分析清單 (CSV)", 
+            data=export_df.to_csv(index=False).encode('utf-8-sig'), 
+            file_name=f"taiwan_stocks_{now_str}.csv", 
+            text="text/csv"
+        )
         
         for item in results:
             with st.container(border=True):
                 st.write(f"### {item['股票']} ({item['產業']})")
                 c1, c2 = st.columns(2)
-                # 修正需求 2：漲幅小數點取到整數 (.0f)
+                # 修正：漲幅取整數顯示
                 c1.metric("價格", f"{item['現價']}", f"{item['漲幅']:.0f}%")
                 c2.write(f"📊 量能比: `{item['量能比']}x` | 📈 K值: `{item['K值']}`")
                 st.markdown(f"""
@@ -192,4 +198,5 @@ if st.button("🔵 執行全台股深度掃描 (依評分排序)", use_container
         st.error("❌ 目前市場環境較弱，無符合條件標的。")
 
 st.divider()
+st.caption(f"📅 系統最後執行時間 (台灣): {taiwan_now.strftime('%Y-%m-%d %H:%M:%S')}")
 st.caption("⚠ 免責聲明：此程式僅供技術分析練習，投資請務必配合大盤走勢參考。")
