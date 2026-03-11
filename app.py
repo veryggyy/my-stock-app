@@ -10,7 +10,7 @@ from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- 1. 頁面設定 ---
-st.set_page_config(page_title="2026 台股 SOP 強勢波段雷達", layout="wide")
+st.set_page_config(page_title="2026 台股強勢波段雷達", layout="wide")
 
 st.markdown("""
     <style>
@@ -25,23 +25,29 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 獲取大盤環境 (^TWII) ---
+# --- 2. 獲取大盤環境 (^TWII) - 優化抓取邏輯 ---
 def get_market_regime():
     try:
-        twii = yf.download("^TWII", period="6mo", progress=False)
-        if twii.empty: return "⚠️ 無法取得大盤數據", "#FFFFFF", 0
+        # 改用 Ticker 模式獲取數據，較不易被封鎖
+        twii_ticker = yf.Ticker("^TWII")
+        twii = twii_ticker.history(period="6mo")
+        
+        if twii.empty or len(twii) < 2:
+            return "⚠️ 數據源暫時忙碌中", "#FFFFFF", 0.0
+            
         twii['MA20'] = ta.sma(twii['Close'], length=20)
         curr_price = twii['Close'].iloc[-1]
         ma20_val = twii['MA20'].iloc[-1]
         daily_ret = (twii['Close'].iloc[-1] / twii['Close'].iloc[-2] - 1) * 100
         
         if curr_price > ma20_val:
-            return "🟢 大盤位於月線上 (多頭起漲)", "#00FFCC", daily_ret
+            return "🟢 大盤位於月線上 (多頭有利)", "#00FFCC", daily_ret
         else:
             return "🔴 大盤位於月線下 (空頭防禦)", "#FF4B4B", daily_ret
-    except: return "⚠️ 數據抓取異常", "#FFFFFF", 0
+    except Exception as e:
+        return f"⚠️ 抓取異常: {str(e)[:10]}", "#FFFFFF", 0.0
 
-# --- 3. 獲取全台股清單 (支援產業欄位) ---
+# --- 3. 獲取清單 (與原架構一致) ---
 @st.cache_data(ttl=600)
 def get_full_taiwan_list():
     stocks = {}
@@ -51,9 +57,9 @@ def get_full_taiwan_list():
         try:
             df = pd.read_csv(file_path, encoding="utf-8-sig")
             for _, row in df.iterrows():
-                code = str(row[0]).strip().upper()
-                name = str(row[1]).strip()
-                sec = str(row[2]).strip() if len(row) > 2 else "未分類"
+                code = str(row.iloc[0]).strip().upper()
+                name = str(row.iloc[1]).strip()
+                sec = str(row.iloc[2]).strip() if len(row) > 2 else "未分類"
                 if len(code) >= 4 and "代號" not in code:
                     full_code = f"{code}.TW" if not (code.endswith('.TW') or code.endswith('.TWO')) else code
                     stocks[full_code] = name
@@ -62,13 +68,12 @@ def get_full_taiwan_list():
         except: pass
     return {"2330.TW": "台積電", "2317.TW": "鴻海"}, {"2330.TW": "半導體", "2317.TW": "電子代工"}, "⚠️ 使用預設清單"
 
-# --- 4. 核心 SOP 分析引擎 ---
+# --- 4. 核心分析引擎 ---
 def analyze_sop_v2026(df, up_threshold):
     try:
         if df is None or len(df) < 65: return None
         df.columns = [str(c).capitalize() for c in df.columns]
         
-        # 指標計算
         df['MA20'] = ta.sma(df['Close'], length=20)
         df['MA60'] = ta.sma(df['Close'], length=60)
         df['MA20_Slope'] = df['MA20'].diff(3) 
@@ -81,22 +86,18 @@ def analyze_sop_v2026(df, up_threshold):
         ret = (float(curr['Close']) / float(prev['Close']) - 1) * 100
         vol_ratio = round(float(curr['Volume'] / curr['VMA5']), 2)
         
-        # 篩選邏輯
-        is_bull_alignment = (curr['Close'] > curr['MA20']) and (curr['MA20'] > curr['MA60'])
+        # 多頭邏輯
+        is_bull = (curr['Close'] > curr['MA20']) and (curr['MA20'] > curr['MA60'])
         is_slope_up = curr['MA20_Slope'] > 0
         is_kd_cross = (curr['K'] > curr['D']) and (prev['K'] <= prev['D'])
         is_breakout = (vol_ratio > 1.2) and (ret >= up_threshold)
         
-        # 基礎數據 (無論是否符合條件都回傳，用於計算產業排行)
         base_res = {"漲幅": ret, "量能比": vol_ratio}
         
-        if is_bull_alignment and is_slope_up and is_kd_cross and is_breakout:
+        if is_bull and is_slope_up and is_kd_cross and is_breakout:
             atr_val = df['ATR'].iloc[-1]
             base_res.update({
-                "符合": True,
-                "訊號": "🔥 三強多頭共振",
-                "現價": round(float(curr['Close']), 2),
-                "K值": int(curr['K']),
+                "符合": True, "現價": round(float(curr['Close']), 2), "K值": int(curr['K']),
                 "買進參考": round(float(curr['Close']), 2),
                 "賣出參考": round(float(curr['Close'] + (atr_val * 2.5)), 2),
                 "支撐參考": round(float(curr['Close'] - (atr_val * 1.5)), 2),
@@ -116,7 +117,8 @@ st.markdown(f"**市場環境：<span style='color:{market_color};'>{market_msg}<
 with st.sidebar:
     st.header("⚙️ 篩選參數")
     ret_target = st.slider("突破漲幅門檻 (%)", 0.0, 5.0, 1.5, 0.5)
-    scan_limit = st.number_input("掃描數量", 10, 3000, 1000)
+    # 修正需求 1：預設值直接設為最大值 3000
+    scan_limit = st.number_input("掃描數量", 10, 3000, 3000)
     if st.button("🔄 清除快取"):
         st.cache_data.clear(); st.rerun()
 
@@ -126,8 +128,7 @@ if st.button("🔵 執行全台股深度掃描 (依評分排序)", use_container
     st.info(status_msg)
     
     tickers = sorted(list(all_stocks.keys()))[:int(scan_limit)]
-    results = []
-    sector_stats = []
+    results, sector_stats = [], []
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -145,7 +146,7 @@ if st.button("🔵 執行全台股深度掃描 (依評分排序)", use_container
                     if res:
                         res["產業"] = all_sectors.get(sym, "未分類")
                         sector_stats.append({"產業": res["產業"], "漲幅": res["漲幅"]})
-                        if res["符合"]:
+                        if res.get("符合"):
                             res["股票"] = f"{sym.split('.')[0]} {all_stocks[sym]}"
                             results.append(res)
                 except: continue
@@ -154,7 +155,7 @@ if st.button("🔵 執行全台股深度掃描 (依評分排序)", use_container
     
     status_text.empty(); progress_bar.empty()
 
-    # --- 7. 顯示產業排行 ---
+    # 產業排行
     st.subheader("📊 產業強弱排行 (目前資金流向)")
     if sector_stats:
         s_df = pd.DataFrame(sector_stats).groupby("產業").mean().sort_values("漲幅", ascending=False)
@@ -164,36 +165,31 @@ if st.button("🔵 執行全台股深度掃描 (依評分排序)", use_container
     
     st.divider()
 
-    # --- 8. 顯示掃描結果與匯出 ---
     if results:
         results = sorted(results, key=lambda x: x['評分'], reverse=True)
         st.success(f"✅ 找到 {len(results)} 檔多頭起漲標的")
         
-        # CSV 匯出功能 (24H 制檔名)
+        # 匯出 CSV (24H 檔名)
         now_str = datetime.now().strftime("%Y%m%d_%H%M")
         export_df = pd.DataFrame(results).drop(columns=["符合"])
-        st.download_button(
-            label="📥 匯出當下分析清單 (CSV)",
-            data=export_df.to_csv(index=False).encode('utf-8-sig'),
-            file_name=f"taiwan_strong_stocks_{now_str}.csv",
-            mime="text/csv"
-        )
+        st.download_button("📥 匯出當下分析清單 (CSV)", export_df.to_csv(index=False).encode('utf-8-sig'), f"taiwan_stocks_{now_str}.csv", "text/csv")
         
         for item in results:
             with st.container(border=True):
                 st.write(f"### {item['股票']} ({item['產業']})")
-                st.write(f"**訊號：{item['訊號']}**")
                 c1, c2 = st.columns(2)
-                c1.metric("價格", f"{item['現價']}", f"{item['漲幅']}%")
+                # 修正需求 2：漲幅小數點取到整數 (.0f)
+                c1.metric("價格", f"{item['現價']}", f"{item['漲幅']:.0f}%")
                 c2.write(f"📊 量能比: `{item['量能比']}x` | 📈 K值: `{item['K值']}`")
                 st.markdown(f"""
                 <div class="price-box">
                 🟢 買進參考：<span style="color:#00FF88;">{item['買進參考']}</span><br>
-                🔵 關鍵支撐(季線/ATR)：<span style="color:#4FACFE;">{item['支撐參考']}</span><br>
+                🔵 關鍵支撐：<span style="color:#4FACFE;">{item['支撐參考']}</span><br>
                 🔴 波段目標：<span style="color:#FF4B4B;">{item['賣出參考']}</span>
                 </div>
                 """, unsafe_allow_html=True)
     else:
-        st.error("❌ 目前市場環境較弱，無符合「多頭起漲」條件的標的。")
+        st.error("❌ 目前市場環境較弱，無符合條件標的。")
 
-st.caption("⚠ 免責聲明：此程式僅供技術分析練習，季線策略仍有假突破風險，請務必配合大盤走勢參考。")
+st.divider()
+st.caption("⚠ 免責聲明：此程式僅供技術分析練習，投資請務必配合大盤走勢參考。")
